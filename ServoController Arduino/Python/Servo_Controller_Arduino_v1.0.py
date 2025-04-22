@@ -36,14 +36,14 @@ def connectBoard():
     global myports
     global arduino_port
     try:
-        arduinoData = serial.Serial("com4", baudrate = 250000, timeout =0.05)
+        arduinoData = serial.Serial("com7", baudrate = 250000, timeout =0.05)
     except:
         print("CONNECTION TO ARDUINO BOARD FAILED")
     else: 
         conn_bool = True
         myports = [tuple(p) for p in list(serial.tools.list_ports.comports())]
         print (myports)
-        arduino_port = [port for port in myports if 'COM3' in port ][0]
+        arduino_port = [port for port in myports if 'COM7' in port ][0]
         port_controller = threading.Thread(target=check_presence, args=(arduino_port, 0.1,))
         port_controller.setDaemon(True)
         port_controller.start()
@@ -80,7 +80,7 @@ class GUI:
         self.sliders.grid(row=1, column= 1, columnspan=3, pady=10)
         self.test_servo.grid(row=2, column= 0, columnspan=3,  sticky=W+E)
         
-        self.min_grad = 110
+        self.min_grad = 0
         self.max_grad = 190
         self.selec = 0
         #TO DO: When Changing Combination restore the Angle vals

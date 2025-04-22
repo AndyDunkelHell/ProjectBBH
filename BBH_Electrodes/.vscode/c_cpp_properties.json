@@ -12,6 +12,7 @@
                 "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/src",
                 "C:/Users/speak/.platformio/packages/framework-arduino-mbed/libraries/Wire",
                 "C:/Users/speak/.platformio/packages/framework-arduino-mbed/libraries/SPI",
+                "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/lib/MegunoLink/src",
                 "C:/Users/speak/.platformio/packages/framework-arduino-mbed/cores/arduino",
                 "C:/Users/speak/.platformio/packages/framework-arduino-mbed/cores/arduino/api/deprecated",
                 "C:/Users/speak/.platformio/packages/framework-arduino-mbed/cores/arduino/api/deprecated-avr-comp",
@@ -65,6 +66,7 @@
                     "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/src",
                     "C:/Users/speak/.platformio/packages/framework-arduino-mbed/libraries/Wire",
                     "C:/Users/speak/.platformio/packages/framework-arduino-mbed/libraries/SPI",
+                    "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/lib/MegunoLink/src",
                     "C:/Users/speak/.platformio/packages/framework-arduino-mbed/cores/arduino",
                     "C:/Users/speak/.platformio/packages/framework-arduino-mbed/cores/arduino/api/deprecated",
                     "C:/Users/speak/.platformio/packages/framework-arduino-mbed/cores/arduino/api/deprecated-avr-comp",
@@ -113,7 +115,7 @@
                 ]
             },
             "defines": [
-                "PLATFORMIO=60116",
+                "PLATFORMIO=60118",
                 "STM32H7",
                 "ARDUINO_PORTENTA_H7_M7",
                 "ARM_MATH_CM7",

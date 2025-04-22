@@ -4,6 +4,7 @@
 #include "events/EventQueue.h"  // For Ticker and EventQueue (from the Portenta Arduino core)
 #include <Wire.h>
 #include "stm32h7xx.h"  // STM32 registers
+#include "CommandHandler.h"
 
 #define NUM_CHANNELS 12
 int CHANNELS[12] = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14};
@@ -32,6 +33,10 @@ uint16_t SendWriteCommand(uint8_t regnum, uint8_t data);
 void Calibrate();
 void NotchFilter50(uint8_t ch);
 void printAllSamples();
+
+CommandHandler<10, 90, 15> SerialCommandHandler;
+
+bool startSerial = false;
 
 //================================================================
 // Notch filter (unchanged)
@@ -64,72 +69,83 @@ void noNotchFilter(uint8_t ch) {
 // SPI sampling task with pipeline delay handling and queue‐based printing
 //================================================================
 void spiSampleTask() {
-    // Define the fixed pipeline delay.
-    const int pipelineDelay = 2;
-    // Total number of dummy commands required to flush the pipeline:
-    const int flushCommands = NUM_CHANNELS + pipelineDelay; // e.g., 12 + 2 = 14
+  // For a 3-command delay:
+  const int pipelineDelay = 2;
+  // Total number of dummy (flush) commands required:
+  const int flushCommands = NUM_CHANNELS + pipelineDelay; 
 
-    // Static variables to control flushing and normal pipeline operation.
-    static bool flushing = true;    // Initially, we are in flushing mode.
-    static int flushCounter = 0;    // Count how many dummy commands have been issued.
+  // Static variables to control flush vs. normal operation.
+  static bool flushing = true;    // Start in flush mode.
+  static int flushCounter = 0;    // Count dummy commands issued.
 
-    // For normal operation after flushing:
-    static bool pipelineInitialized = false;
-    static uint8_t pipelineQueue[2];      // Holds the indices of channels whose commands are "in flight".
-    static uint8_t currentChannelIndex = 0; // Next channel index to command.
-    static uint8_t sampleCounter = 0;       // Count how many valid samples have been processed.
+  // Variables for normal operation (after flush is complete):
+  static bool pipelineInitialized = false;
+  // pipelineQueue will hold channel indices (0 to NUM_CHANNELS-1)
+  static uint8_t pipelineQueue[pipelineDelay];
+  static uint8_t currentChannelIndex = 0; // Next channel index (0...NUM_CHANNELS-1) to issue a command for.
+  static uint8_t sampleCounter = 0;       // Count how many valid samples have been processed.
 
-    //--------------------------------------------------------------------------
-    // FLUSH PHASE: Issue dummy conversions until the pipeline is entirely flushed.
-    //--------------------------------------------------------------------------
-    if (flushing) {
-        // Issue a dummy conversion command for the current channel.
-        SendConvertCommand(CHANNELS[currentChannelIndex]);
-        currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
-        flushCounter++;
-        // When flushCommands have been issued, initialize the pipeline queue.
-        if (flushCounter >= flushCommands) {
-            flushing = false;
-            // The last two commands issued (indices flushCommands-2 and flushCommands-1, modulo NUM_CHANNELS)
-            // will form the initial pipeline.
-            pipelineQueue[0] = (flushCommands - 2) % NUM_CHANNELS;  // For 14: (14-2)=12 mod 12 = 0.
-            pipelineQueue[1] = (flushCommands - 1) % NUM_CHANNELS;  // (14-1)=13 mod 12 = 1.
-            // currentChannelIndex is already updated (should be 2 here).
-            pipelineInitialized = true;
-        }
-        return; // Do not process any results until flushing is complete.
-    }
-    //--------------------------------------------------------------------------
-    // NORMAL OPERATION: Process samples using the established pipeline.
-    //--------------------------------------------------------------------------
-    if (!pipelineInitialized) {
-        // Safety check—should not occur.
-        return;
-    }
+  //------------------------------------------------------------------
+  // FLUSH PHASE: Issue dummy conversion commands to fill the pipeline.
+  //------------------------------------------------------------------
+  if (flushing) {
+      // Issue a dummy conversion command for the channel at currentChannelIndex.
+      SendConvertCommandH(CHANNELS[currentChannelIndex]);
+      // Move to the next channel index (wrap around).
+      currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
+      flushCounter++;
+      // When we've issued flushCommands dummy commands, initialize the pipeline.
+      if (flushCounter >= flushCommands) {
+          flushing = false;
+          // Fill the pipelineQueue with the channel indices that correspond to the last 'pipelineDelay' commands.
+          for (int i = flushCommands - pipelineDelay; i < flushCommands; i++) {
+              // Instead of storing CHANNELS[i % NUM_CHANNELS],
+              // store the channel index (i % NUM_CHANNELS).
+              pipelineQueue[i - (flushCommands - pipelineDelay)] = i % NUM_CHANNELS;
+          }
+          pipelineInitialized = true;
+      }
+      return; // Don't process any result during flushing.
+  }
 
-    // Issue a conversion command for the current channel.
-    uint16_t newResult = SendConvertCommand(CHANNELS[currentChannelIndex]);
-    
-    // The result returned now corresponds to the channel that was at the head of the pipeline.
-    uint8_t channelIndexToProcess = pipelineQueue[0];
-    
-    // Shift the pipeline: discard the head and append the current channel.
-    pipelineQueue[0] = pipelineQueue[1];
-    pipelineQueue[1] = currentChannelIndex;
-    
-    // Update the current channel (wrap around).
-    currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
-    
-    // Store and filter the conversion result for the mapped channel.
-    channel_data[channelIndexToProcess] = newResult;
-    NotchFilter50(channelIndexToProcess);
-    
-    // Count the number of processed channels; when a full set is ready, schedule printing.
-    sampleCounter++;
-    if (sampleCounter >= NUM_CHANNELS) {
-       queue.call(printAllSamples);
-       sampleCounter = 0;
-    }
+  // Safety check (should never happen)
+  if (!pipelineInitialized) {
+      return;
+  }
+
+  //------------------------------------------------------------------
+  // NORMAL OPERATION: Process conversion results in a round-robin manner.
+  //------------------------------------------------------------------
+  // Issue a conversion command for the current channel.
+  uint16_t newResult = SendConvertCommandH(CHANNELS[currentChannelIndex]);
+  
+  // The returned result corresponds to the channel at the head of the pipeline.
+  uint8_t channelIndexToProcess = pipelineQueue[0];
+
+  // Shift the pipelineQueue one position to the left.
+  for (int i = 0; i < pipelineDelay - 1; i++) {
+      pipelineQueue[i] = pipelineQueue[i + 1];
+  }
+  // Append the current channel index at the end of the pipeline.
+  pipelineQueue[pipelineDelay - 1] = currentChannelIndex;
+
+  // Update currentChannelIndex for next call (wrap around).
+  currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
+
+  // Store the new conversion result into the proper slot.
+  channel_data[channelIndexToProcess] = newResult;
+  // Process the raw data – if you're not filtering, use the noNotchFilter.
+  // noNotchFilter(channelIndexToProcess);
+  NotchFilter50(channelIndexToProcess);
+  // (If you want to use the notch filter instead, call NotchFilter50(channelIndexToProcess);)
+
+  // Increment the sample counter. When we've processed a full cycle of NUM_CHANNELS samples,
+  // schedule printing of the complete set.
+  sampleCounter++;
+  if (sampleCounter >= NUM_CHANNELS) {
+      queue.call(printAllSamples);
+      sampleCounter = 0;
+  }
 }
 
 //================================================================
@@ -326,6 +342,18 @@ void scanI2C() {
   Serial.println("I2C scan complete.");
 }
 
+void conn(CommandParameter &Parameters) {
+  Serial.println("Connected");
+  startSerial = true;
+  // Create a thread for the event queue
+  static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
+  eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
+  Serial.println("Event thread started");
+  
+  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
+  sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
+}
+
 //================================================================
 // Setup: initialize SPI, I2C, timers, etc.
 //================================================================
@@ -342,20 +370,19 @@ void setup() {
     pinMode(D5, OUTPUT);
     digitalWrite(D5, HIGH);
 
-    // Create a thread for the event queue
-    static rtos::Thread eventThread(osPriorityHigh, 4096); // 16KB stack
-    eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
-    Serial.println("Event thread started");
+    SerialCommandHandler.AddCommand(F("connect"), conn);
 
-    // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-    sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
 }
+
 
 //================================================================
 // Main loop: now empty – printing is handled by the event queue.
 //================================================================
 void loop() {
-    // Nothing to do here as printing occurs once a full set of samples is ready.
+  if(!startSerial){
+    SerialCommandHandler.Process();
+  }
+  // Nothing to do here as printing occurs once a full set of samples is ready.
 }
 
 //================================================================
