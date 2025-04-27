@@ -11,9 +11,10 @@ import time
 from scipy.signal import iirnotch, filtfilt, butter
 
 # Global flags and data buffer
+NUM_CH = 12  # Number of channels to read from the serial port
 running = False         # Controls whether the serial feed is running
 toggle_metric = False   # Flag for toggling testing metric calculations
-data_buffer = np.empty((0, 12))  # Buffer for incoming data (assumes 12 channels)
+data_buffer = np.empty((0, NUM_CH))  # Buffer for incoming data (assumes NUM_CH channels)
 record_file = None
 metrics_file = None
 
@@ -22,8 +23,8 @@ channel_vars = []  # Tkinter BooleanVars for each channel's display toggle
 metrics_labels = []    
 
 snr_state = "idle"
-still_data = np.empty((0, 12))
-active_data = np.empty((0, 12))
+still_data = np.empty((0, NUM_CH))
+active_data = np.empty((0, NUM_CH))
 
 snr_label = None
 
@@ -50,7 +51,7 @@ def butter_bandpass(lowcut, highcut, fs, order=4):
     b, a = butter(order, [low, high], btype='band', analog=False)
     return b, a
 
-def bandpass_filter(data, lowcut=20, highcut=450, fs=1000, order=4):
+def bandpass_filter(data, lowcut=20, highcut=450, fs=12000, order=4):
     """
     Apply a bandpass filter to each channel of the data.
     :param data: 2D numpy array of shape (samples, channels).
@@ -66,7 +67,7 @@ def bandpass_filter(data, lowcut=20, highcut=450, fs=1000, order=4):
         filtered_data[:, ch] = filtfilt(b, a, data[:, ch])
     return filtered_data
 
-def notch_filter_50Hz(signal, fs=1000.0, quality=60.0):
+def notch_filter_50Hz(signal, fs=12000.0, quality=60.0):
     """Apply a 50 Hz notch filter to each column in 'signal'.
     :param signal: 2D numpy array of shape (samples, channels)
     :param fs: Sampling frequency (Hz)
@@ -117,7 +118,7 @@ def moving_average(signal, window_size=5):
     return smoothed
 
 # Serial reading function (runs in a separate thread)
-def read_serial_data(port="COM3", baud=250000):
+def read_serial_data(port="COM4", baud=250000):
     global running, data_buffer, record_file
     try:
         ser = serial.Serial(port, baud, timeout=1)
@@ -135,8 +136,8 @@ def read_serial_data(port="COM3", baud=250000):
             if not line:
                 continue
             parts = line.split(',')
-            parts = parts[:12]  # Keep only the first 12 values
-            if len(parts) != 12:  # Ensure we have data for all 12 channels
+            parts = parts[:NUM_CH]  # Keep only the first NUM_CH values
+            if len(parts) != NUM_CH:  # Ensure we have data for all NUM_CH channels
                 continue
             new_row = np.array([float(p) for p in parts])
             # Append new data and keep a fixed-size buffer (last 1000 samples)
@@ -205,11 +206,11 @@ def snr_button():
     global snr_state, still_data, active_data
     if snr_state == "idle":
         snr_state = "still"
-        still_data = np.empty((0, 12))
+        still_data = np.empty((0, NUM_CH))
         snr_label.config(text="SNR State: Collecting STILL data... (Press again for ACTIVE)")
     elif snr_state == "still":
         snr_state = "active"
-        active_data = np.empty((0, 12))
+        active_data = np.empty((0, NUM_CH))
         snr_label.config(text="SNR State: Collecting ACTIVE data... (Press again to compute SNR)")
     elif snr_state == "active":
         # Compute SNR
@@ -220,7 +221,7 @@ def snr_button():
 
         # Display SNR results
         text_lines = ["SNR Results:"]
-        for ch in range(12):
+        for ch in range(NUM_CH):
             text_lines.append(f"Ch {ch+1}: {snr_values[ch]:.2f} dB")
         snr_label.config(text="\n".join(text_lines) + "\n(Press again to reset)")
     
@@ -231,7 +232,7 @@ def snr_button():
 
             start_still = still_data[:10]
             metrics_file.write("start\n")
-            for ch in range(12):
+            for ch in range(NUM_CH):
                 for value in start_still[:, ch]:
                     metrics_file.write(f"{value};")
                 metrics_file.write("\n")
@@ -239,7 +240,7 @@ def snr_button():
             metrics_file.write("end\n")
             end_still = still_data[-10:]
 
-            for ch in range(12):
+            for ch in range(NUM_CH):
                 for value in end_still[:, ch]:
                     metrics_file.write(f"{value};")
                 metrics_file.write("\n")
@@ -248,14 +249,14 @@ def snr_button():
             metrics_file.write("active_data\n")
             start_active = active_data[:10]
             metrics_file.write("start\n")
-            for ch in range(12):
+            for ch in range(NUM_CH):
                 for value in start_active[:, ch]:
                     metrics_file.write(f"{value};")
                 metrics_file.write("\n")
             
             metrics_file.write("end\n")
             end_active = active_data[-10:]
-            for ch in range(12):
+            for ch in range(NUM_CH):
                 for value in end_active[:, ch]:
                     metrics_file.write(f"{value};")  
 
@@ -268,7 +269,7 @@ def snr_button():
             metrics_file.write(snr_line)
             general_a_max_mav = np.max(a_mav_vals) if np.max(a_mav_vals) != 0 else 1e-12
 
-            for ch in range(12):
+            for ch in range(NUM_CH):
                     curr_mav_sdata = s_mav_vals[ch] 
                     curr_mav_adata = a_mav_vals[ch]
                     curr_cv_sdata = s_cv_vals[ch]
@@ -303,7 +304,7 @@ def compute_snr(still_arr, active_arr):
     If still or active arrays are empty, returns an array of NaNs.
     """
     if still_arr.shape[0] == 0 or active_arr.shape[0] == 0:
-        return np.full((12,), np.nan)
+        return np.full((NUM_CH,), np.nan)
 
     # RMS of STILL
     rms_still = np.sqrt(np.mean(still_arr**2, axis=0))
@@ -326,11 +327,11 @@ def compute_snr(still_arr, active_arr):
 def compute_metrics(data):
     """
     Computes RMS, CV, MAV for each channel over 'data'.
-    Returns arrays of shape (12,).
+    Returns arrays of shape (NUM_CH,).
     """
     # If data is empty, return zeros
     if data.shape[0] == 0:
-        ch_count = data.shape[1] if data.shape[1] else 12
+        ch_count = data.shape[1] if data.shape[1] else NUM_CH
         return (np.zeros(ch_count), np.zeros(ch_count), np.zeros(ch_count))
 
     # RMS
@@ -358,16 +359,16 @@ fig, ax = plt.subplots()
 canvas = FigureCanvasTkAgg(fig, master=root)
 canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-# Initialize plot lines for 12 channels
+# Initialize plot lines for NUM_CH channels
 lines = []
-colors = plt.cm.viridis(np.linspace(0, 1, 12))
-for ch in range(12):
+colors = plt.cm.viridis(np.linspace(0, 1, NUM_CH))
+for ch in range(NUM_CH):
     (line,) = ax.plot([], [], color=colors[ch], label=f"Channel {ch+1}")
     lines.append(line)
 
 ax.set_xlim(0, 500)  # Display last 1000 samples on X-axis
 
-ax.set_ylim(-4000, 4000)
+ax.set_ylim(-5000, 5000)
 #ax.set_ylim(-4000, 4000000)
 
 ax.set_xlabel("Sample")
@@ -403,7 +404,7 @@ metrics_frame = ttk.Frame(root)
 metrics_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
 
 # Initialize toggles and RMS labels for each channel
-for ch in range(12):
+for ch in range(NUM_CH):
     var = tk.BooleanVar(value=True)
     channel_vars.append(var)
     # Checkbutton to toggle channel visibility
@@ -429,7 +430,7 @@ def update(frame):
 
     # If lowpass filter toggle is enabled, filter the data
     if lowpass_var.get():
-        data_to_plot = bandpass_filter(data_buffer)
+        data_to_plot = teager_kaiser_energy(data_buffer)
     else:
         data_to_plot = data_buffer
 
@@ -458,7 +459,7 @@ def update(frame):
     if toggle_metric:
         # Use the data_to_plot for these computations
         rms_vals, cv_vals, mav_vals = compute_metrics(data_to_plot)
-        for ch in range(12):
+        for ch in range(NUM_CH):
             metrics_labels[ch].config(
                 text=(
                     f"Ch {ch+1} -> "
