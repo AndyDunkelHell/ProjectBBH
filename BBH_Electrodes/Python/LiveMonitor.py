@@ -18,6 +18,7 @@ toggle_metric = False   # Flag for toggling testing metric calculations
 data_buffer = np.empty((0, NUM_CH))  # Buffer for incoming data (assumes NUM_CH channels)
 record_file = None
 metrics_file = None
+_COM_PORT = "COM4"  # Serial port for the Arduino (change as needed)
 
 # Variables for channel toggles and RMS labels
 channel_vars = []  # Tkinter BooleanVars for each channel's display toggle
@@ -127,18 +128,11 @@ def read_serial_data():
     global running, data_buffer, record_file, ser
         # This will hold the last-seen IMU reading
     latest_imu = None
-    # try:
-    #     ser = serial.Serial(port, baud, timeout=1)
-    #     ser.write('!connect\r'.encode())
-    #     # in_line = ser.readline().decode()
-        
-    # except Exception as e:
-    #     print("Error opening serial port:", e)
-    #     return
     while running:
         try:
             # Read a line and parse it (expecting comma-separated floats)
             line = ser.readline().decode('utf-8', errors='replace').strip()
+            # status.config(text=line)
             # print(line)
             if not line:
                 continue
@@ -168,8 +162,12 @@ def read_serial_data():
                     data_buffer = data_buffer[-1000:]
                 if record_file is not None:
                     record_file.write(','.join(parts) + '\n')
+        except (IOError, ValueError) as e:
+            # status.config(text="Error writing to file: " + str(e), fg="red")
+            break
         except Exception as e:
-            print("Error reading/parsing data:", e)
+            status.config(text="Error reading/parsing data:" + str(e),fg= "red")
+            # print("Error reading/parsing data:", e)
     # ser.write('!DC\r'.encode())
     # ser.close()
 
@@ -179,19 +177,21 @@ def read_serial_data():
 
 # Button callback: start the feed
 def start_feed():
-    global running, record_file, last_metrics_store_time, metrics_file, ser, read_thread
+    global running, record_file, last_metrics_store_time, metrics_file, ser, read_thread, _COM_PORT
     if running:
         return
     # 1) open the port
     try:
-        ser = serial.Serial("COM4", 250000, timeout=1,
+        ser = serial.Serial(_COM_PORT, 250000, timeout=1,
                             dsrdtr=False, rtscts=False)  # disable hardware handshakes
-        time.sleep(2)                                     # wait for USB-CDC stabilization :contentReference[oaicite:9]{index=9}
+        time.sleep(5)                                     # wait for USB-CDC stabilization :contentReference[oaicite:9]{index=9}
         ser.reset_input_buffer()                          # clear stale data
-        ser.reset_output_buffer()
+        ser.reset_output_buffer()                              # allow command to flush :contentReference[oaicite:5]{index=5}
         ser.write(b'!connect\r')    
     except Exception as e:
-        print("Error opening serial port:", e)
+        tk.messagebox.showerror("Serial Error", f"Could not open {_COM_PORT}:\n{e}")
+        # status.config(text="Error opening serial port:" + str(e),fg= "red") 
+        # print("Error opening serial port:", e)
         return
     
     running = True
@@ -209,8 +209,9 @@ def start_feed():
 
     read_thread = threading.Thread(target=read_serial_data, daemon=True)
     read_thread.start()
-    
-    print(f"Started data feed from serial port. Recording to {r_filename}")
+
+    status.config(text="Started data feed from serial port." + str(r_filename),fg= "green")
+    # print(f"Started data feed from serial port. Recording to {r_filename}")
 
 
 # Button callback: stop the feed
@@ -223,7 +224,8 @@ def stop_feed():
     try:
         ser.write(b'!DC\r')
     except Exception as e:
-        print("Error sending DC command:", e)
+        status.config(text="Error sending DC command:" + str(e),fg= "red")
+        # print("Error sending DC command:", e)
 
     # 2) stop the reader loop
     running = False
@@ -249,14 +251,15 @@ def stop_feed():
 
     ser = None
     read_thread = None
-
-    print("Stopped data feed.")
+    status.config(text="Stopped data feed.",fg= "orange")
+    # print("Stopped data feed.")
 
 # Button callback: toggle metric computation/display
 def toggle_metrics():
     global toggle_metric
     toggle_metric = not toggle_metric
-    print("Toggle Metrics is now", "ON" if toggle_metric else "OFF")
+    status.config(text="Toggle Metrics is now " + ("ON" if toggle_metric else "OFF"),fg= "green")
+    # print("Toggle Metrics is now", "ON" if toggle_metric else "OFF")
 
 ############################################################
 #             SNR Measurement Button/Logic                 #
@@ -385,8 +388,6 @@ def compute_snr(still_arr, active_arr):
     snr_db = 20 * np.log10(rms_active / rms_still)
     return snr_db
 
-
-
 ############################################################
 #          Metrics Computation (RMS, CV, MAV)              #
 ############################################################
@@ -415,6 +416,108 @@ def compute_metrics(data):
     mav = np.mean(np.abs(data), axis=0)
 
     return (rms, cv, mav)
+
+
+
+# ------------------------------------------------------------------------------
+# 1) Add a menubar with “Windows → Servo Controller”
+# ------------------------------------------------------------------------------
+def make_menubar(root):
+    menubar = tk.Menu(root)
+    tools_menu = tk.Menu(menubar, tearoff=False)
+    tools_menu.add_command(label="Servo Controller", command=lambda: open_servo_window(root))
+    menubar.add_cascade(label="Tools", menu=tools_menu)
+    root.config(menu=menubar)
+
+
+def open_servo_window(root):
+    global _COM_PORT
+    # Disable main window while this is open
+    root.attributes('-disabled', True)
+    stop_feed()  # Stop the feed if it's running
+
+    servo_win = tk.Toplevel(root)
+    servo_win.title("Servo Controller v1.0 ARDUINO")
+    servo_win.protocol("WM_DELETE_WINDOW", lambda: close_servo_window(root, servo_win))
+
+    # ——— Match your standalone layout exactly —————————————
+    frame1     = tk.LabelFrame(servo_win,
+                               text='Servo Angle (in Degrees)',
+                               padx=5, pady=52,
+                               bg='black', fg='white')
+    frame2     = tk.LabelFrame(servo_win,
+                               text='Controls',
+                               padx=1, pady=1)
+    sliders    = tk.LabelFrame(frame2, text='Sliders')
+    test_servo = tk.LabelFrame(servo_win,
+                               text='Test Servo',
+                               padx=1, pady=10)
+
+    frame1.grid(    row=0, column=0,           sticky='nsew')
+    frame2.grid(    row=0, column=1, columnspan=2, sticky='ew')
+    sliders.grid(   row=1, column=1, columnspan=3, pady=10, sticky='ew')
+    test_servo.grid(row=2, column=0, columnspan=3, sticky='ew')
+
+    # Try opening the servo serial port
+    try:
+        servo_serial = serial.Serial(_COM_PORT, 250000, timeout=0.1)
+    except Exception as e:
+        tk.messagebox.showerror("Serial Error", f"Could not open {_COM_PORT}:\n{e}")
+        close_servo_window(root, servo_win)
+        return
+
+    # Prepare 16 IntVars + the left-pane live-value labels
+    vals = [tk.IntVar(value=0) for _ in range(16)]
+    val_labels = []
+    for i in range(16):
+        tk.Label(frame1,
+                 text=f"Servo {i+1}:",
+                 bg='black', fg='white'
+        ).grid(row=i, column=0, sticky='w', padx=5, pady=2)
+
+        vl = tk.Label(frame1,
+                      text='0',
+                      bg='black', fg='yellow'
+        )
+        vl.grid(row=i, column=1, sticky='w', padx=5, pady=2)
+        val_labels.append(vl)
+
+    # Function to send all 16 values whenever any slider moves
+    def send_all(idx, value):
+        vals[idx].set(int(value))
+        val_labels[idx].configure(text=value)
+        packet = "!UD" + "".join(f" {v.get()}" for v in vals) + "\r"
+        try:
+            servo_serial.write(packet.encode())
+        except Exception as e:
+            status.config(text="Servo write failed:" + str(e),fg= "red")
+            # print("Servo write failed:", e)
+
+    # Create 16 sliders in 4 columns (4 sliders per column) in the Sliders pane
+    for i in range(16):
+        row = i % 4  # Determine the row (0-3)
+        col = i // 4  # Determine the column (0-3)
+        s = tk.Scale(sliders,
+                     from_=0, to=190,
+                     orient='vertical',
+                     variable=vals[i],
+                     command=lambda v, idx=i: send_all(idx, v),
+                     repeatdelay=500
+        )
+        s.grid(row=row, column=col, sticky='we', padx=2)
+        sliders.columnconfigure(col, weight=1)
+    # Keep the serial port handle around so we can close it
+    servo_win.servo_serial = servo_serial
+
+def close_servo_window(root, servo_win):
+    # close serial port
+    try:
+        servo_win.servo_serial.close()
+    except:
+        pass
+    servo_win.destroy()
+    # re-enable main window
+    root.attributes('-disabled', False)
 
 # Set up the Tkinter window
 root = tk.Tk()
@@ -446,6 +549,16 @@ ax.legend(loc="upper right")
 control_frame = ttk.Frame(root)
 control_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
 
+# Create a new frame for the status bar below everything
+status_frame = ttk.Frame(root)
+status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5, before=control_frame)
+
+# Status bar at bottom, just like Servo_Controller did
+status = tk.Label(status_frame,
+                  bd=1, relief='sunken',
+                  anchor='w', text='Status')
+status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
 start_btn = ttk.Button(control_frame, text="Start Feed", command=start_feed)
 start_btn.pack(side=tk.LEFT, padx=5)
 
@@ -469,6 +582,8 @@ toggle_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
 # Metrics display frame
 metrics_frame = ttk.Frame(root)
 metrics_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+
+make_menubar(root)
 
 # Initialize toggles and RMS labels for each channel
 for ch in range(NUM_CH):
@@ -554,7 +669,4 @@ def update(frame):
 
 # Create the animation (updates every 30 ms)
 ani = animation.FuncAnimation(fig, update, interval=60, blit=True)
-
-
-
 root.mainloop()

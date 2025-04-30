@@ -46,6 +46,8 @@ std::atomic<size_t> imuHead(0), imuTail(0);
 extern TwoWire Wire1;
 Adafruit_LSM6DS3TRC imu;
 
+extern TwoWire Wire2; // I2C bus for the PWM driver (Adafruit_PWMServoDriver)
+bool servo_board = false;
 // Forward declarations of SPI commands and helper functions.
 uint16_t SendConvertCommand(uint8_t channelnum);
 uint16_t SendReadCommand(uint8_t regnum);
@@ -59,17 +61,12 @@ CommandHandler<10, 90, 15> SerialCommandHandler;
 
 bool startSerial = false;
 
-const int g6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,50};
-const int g7[16] = {180,180,0,180,180,0,180,180,0,180,180,0,180,180,0,0};
-static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40, Wire2);
 
 
 const int SERVOMIN = 125;
-const int SERVOMAX = 600;
+const int SERVOMAX = 575;
 const int SERVONUM = 16;
-
-std::vector<int> pendingPrintIds;
-
 
 //================================================================
 // Notch filter (unchanged)
@@ -459,6 +456,8 @@ void testSPIConnection()
 //================================================================
 void scanI2C() {
   byte error, address;
+
+  // ————— Scan primary I2C bus (Wire) —————
   int count0 = 0;
   Serial.println("Scanning primary I2C bus (Wire) for devices...");
   for (address = 1; address < 127; address++) {
@@ -467,8 +466,7 @@ void scanI2C() {
     if (error == 0) {
       Serial.print("Wire device found at 0x");
       if (address < 16) Serial.print("0");
-      Serial.print(address, HEX);
-      Serial.println();
+      Serial.println(address, HEX);
       count0++;
     } else if (error == 4) {
       Serial.print("Wire unknown error at 0x");
@@ -478,6 +476,7 @@ void scanI2C() {
   }
   if (count0 == 0) Serial.println("No devices found on Wire.");
 
+  // ————— Scan secondary I2C bus (Wire1) —————
   int count1 = 0;
   Serial.println("Scanning secondary I2C bus (Wire1) for devices...");
   for (address = 1; address < 127; address++) {
@@ -486,8 +485,7 @@ void scanI2C() {
     if (error == 0) {
       Serial.print("Wire1 device found at 0x");
       if (address < 16) Serial.print("0");
-      Serial.print(address, HEX);
-      Serial.println();
+      Serial.println(address, HEX);
       count1++;
     } else if (error == 4) {
       Serial.print("Wire1 unknown error at 0x");
@@ -496,8 +494,23 @@ void scanI2C() {
     }
   }
   if (count1 == 0) Serial.println("No devices found on Wire1.");
+  // ————— Scan tertiary I2C bus (Wire2) for PWM driver —————
+  Serial.println("Scanning tertiary I2C bus (Wire2) for PWM driver...");
+  Wire2.beginTransmission(0x40); // Address of Adafruit PWM Servo Driver
+  error = Wire2.endTransmission();
+  if (error == 0) {
+    Serial.println("Adafruit PWM Servo Driver found at 0x40");
+    servo_board = true;
+  } else if (error == 4) {
+    Serial.println("Wire2 unknown error at 0x40");
+  } else {
+    servo_board = false;
+    Serial.println("No Adafruit PWM Servo Driver found on Wire2.");
+
+  }
 
   Serial.println("I2C scan complete.");
+
 }
 
 void conn(CommandParameter &Parameters)
@@ -540,8 +553,12 @@ void BBHIdentity(CommandParameter &parameters){
   
 
 void UpdateDeg(CommandParameter &parameters){
+  if(!servo_board){
+    return;
+  }
 
   int ang0 = parameters.NextParameterAsInteger();
+  Serial.print(ang0);
   pwm.setPWM(0,0,angleToPulseinv(ang0));
   int ang1 = parameters.NextParameterAsInteger();
   pwm.setPWM(1,0,angleToPulse(ang1));
@@ -590,6 +607,7 @@ void setup()
   testSPIConnection();
   Wire.begin();
   Wire1.begin();
+  Wire2.begin(); // SDA2/SCL2 for PWM driver
   delay(100);
       // secondary I2C for IMU on SDA1/SCL1
     if (! imu.begin_I2C(0x6A, &Wire1)) {
@@ -616,6 +634,11 @@ void setup()
   // Start background thread to fetch IMU data from M4
   // static rtos::Thread imuThread(osPriorityNormal, 4*1024);
   imuThread.start(mbed::callback(imuReceiveTask));
+
+  pwm.begin();
+  pwm.setPWMFreq(60); // Analog servos run at ~60 Hz updates
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWM(0, 0, SERVOMIN);
           
   // RPC.begin();
   SerialCommandHandler.AddCommand(F("connect"), conn);
