@@ -139,7 +139,7 @@ def read_serial_data():
         try:
             # Read a line and parse it (expecting comma-separated floats)
             line = ser.readline().decode('utf-8', errors='replace').strip()
-            print(line)
+            # print(line)
             if not line:
                 continue
             parts = line.split('|')
