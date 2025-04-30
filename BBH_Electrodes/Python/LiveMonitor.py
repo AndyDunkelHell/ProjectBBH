@@ -11,7 +11,8 @@ import time
 from scipy.signal import iirnotch, filtfilt, butter
 
 # Global flags and data buffer
-NUM_CH = 12  # Number of channels to read from the serial port
+NUM_ELEC =12
+NUM_CH = NUM_ELEC + 6  # Number of channels to read from the serial port
 running = False         # Controls whether the serial feed is running
 toggle_metric = False   # Flag for toggling testing metric calculations
 data_buffer = np.empty((0, NUM_CH))  # Buffer for incoming data (assumes NUM_CH channels)
@@ -67,7 +68,7 @@ def bandpass_filter(data, lowcut=20, highcut=450, fs=12000, order=4):
         filtered_data[:, ch] = filtfilt(b, a, data[:, ch])
     return filtered_data
 
-def notch_filter_50Hz(signal, fs=12000.0, quality=60.0):
+def notch_filter_50Hz(signal, fs=1000.0, quality=60.0):
     """Apply a 50 Hz notch filter to each column in 'signal'.
     :param signal: 2D numpy array of shape (samples, channels)
     :param fs: Sampling frequency (Hz)
@@ -120,6 +121,8 @@ def moving_average(signal, window_size=5):
 # Serial reading function (runs in a separate thread)
 def read_serial_data(port="COM4", baud=250000):
     global running, data_buffer, record_file
+        # This will hold the last-seen IMU reading
+    latest_imu = None
     try:
         ser = serial.Serial(port, baud, timeout=1)
         ser.write('!connect\r'.encode())
@@ -135,17 +138,32 @@ def read_serial_data(port="COM4", baud=250000):
             # print(line)
             if not line:
                 continue
-            parts = line.split(',')
-            parts = parts[:NUM_CH]  # Keep only the first NUM_CH values
-            if len(parts) != NUM_CH:  # Ensure we have data for all NUM_CH channels
+            parts = line.split('|')
+            # print(parts)
+            if len(parts) != 2:
                 continue
-            new_row = np.array([float(p) for p in parts])
-            # Append new data and keep a fixed-size buffer (last 1000 samples)
-            data_buffer = np.vstack([data_buffer, new_row])
-            if data_buffer.shape[0] > 1000:
-                data_buffer = data_buffer[-1000:]
-            if record_file is not None:
-                record_file.write(','.join(parts) + '\n')
+
+            parts_elec = parts[0].split(',')
+            parts_imu = parts[1].split(',')
+
+            if len(parts_imu) == 6:
+                # convert once, store for next ELEC
+                latest_imu = [float(x) for x in parts_imu]
+                # print(latest_imu)
+                
+            if len(parts_elec) == 12 and latest_imu is not None:
+                # print(parts_elec)
+                # Ensure we have data for all NUM_CH channels
+                elec_floats = [float(x) for x in parts_elec]
+                # print(elec_floats)
+
+                new_row = elec_floats + latest_imu
+                # Append new data and keep a fixed-size buffer (last 1000 samples)
+                data_buffer = np.vstack([data_buffer, new_row])
+                if data_buffer.shape[0] > 1000:
+                    data_buffer = data_buffer[-1000:]
+                if record_file is not None:
+                    record_file.write(','.join(parts) + '\n')
         except Exception as e:
             print("Error reading/parsing data:", e)
     ser.close()
@@ -430,7 +448,22 @@ def update(frame):
 
     # If lowpass filter toggle is enabled, filter the data
     if lowpass_var.get():
-        data_to_plot = teager_kaiser_energy(data_buffer)
+        # grab elec and imu separately
+        elec = data_buffer[:, :12]
+        imu  = data_buffer[:, 12:]
+
+        # filter the elec channels
+        filtered12 = notch_filter_50Hz(elec)
+
+        # compute a common row-count
+        n_rows = min(filtered12.shape[0], imu.shape[0])
+
+        # slice both to the last n_rows samples
+        f12 = filtered12[-n_rows:, :]
+        iu  = imu         [-n_rows:, :]
+
+        # stitch back together
+        data_to_plot = np.concatenate([f12, iu], axis=1)
     else:
         data_to_plot = data_buffer
 

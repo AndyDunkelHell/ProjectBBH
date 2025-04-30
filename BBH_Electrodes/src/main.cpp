@@ -1,13 +1,20 @@
+#ifdef CORE_CM7  // M7 core code handles Intan SPI and RPC reception
 #include <SPI.h>
 #include "mbed.h"
 #include "rtos.h"
 #include "events/EventQueue.h" // For Ticker and EventQueue (from the Portenta Arduino core)
 #include <Wire.h>
+#include <Adafruit_LSM6DS3TRC.h>
+#include "RPC.h" 
+#include <Adafruit_Sensor.h>
 #include "stm32h7xx.h" // STM32 registers
 #include "CommandHandler.h"
+#include <atomic>
+#include <SerialRPC.h>
 
 #define NUM_CHANNELS 12
 int CHANNELS[12] = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14};
+
 // Alternatively, you could change the order with:
 // int CHANNELS[12] = {11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1};
 
@@ -24,6 +31,16 @@ float outBuffer[NUM_CHANNELS][3] = {0};
 // Create an EventQueue and a Ticker (from Mbed OS)
 events::EventQueue queue(32 * EVENTS_EVENT_SIZE);
 mbed::Ticker sampleTicker;
+
+// IMU handling on CM7: lock‑free ring buffer for incoming samples
+struct IMUSample { int32_t ax, ay, az, gx, gy, gz; };
+constexpr size_t IMU_BUFFER_SIZE = 32;
+IMUSample imuBuffer[IMU_BUFFER_SIZE];
+std::atomic<size_t> imuHead(0), imuTail(0);
+
+// IMU instance on secondary I2C bus (Wire1)
+extern TwoWire Wire1;
+Adafruit_LSM6DS3TRC imu;
 
 // Forward declarations of SPI commands and helper functions.
 uint16_t SendConvertCommand(uint8_t channelnum);
@@ -139,9 +156,8 @@ void spiSampleTask()
   // Store the new conversion result into the proper slot.
   channel_data[channelIndexToProcess] = newResult;
   // Process the raw data – if you're not filtering, use the noNotchFilter.
-  // noNotchFilter(channelIndexToProcess);
-  NotchFilter50(channelIndexToProcess);
-  // (If you want to use the notch filter instead, call NotchFilter50(channelIndexToProcess);)
+  noNotchFilter(channelIndexToProcess);
+  // NotchFilter50(channelIndexToProcess);
 
   // Increment the sample counter. When we've processed a full cycle of NUM_CHANNELS samples,
   // schedule printing of the complete set.
@@ -151,21 +167,105 @@ void spiSampleTask()
     queue.call(printAllSamples);
     sampleCounter = 0;
   }
+
 }
+
+
+//-----------------------------------------------------------------------------
+// Thread to receive ASCII IMU lines from M4 over RPC and push into ring buffer
+//-----------------------------------------------------------------------------  
+void imuReceiveTask() {
+  static char buf[80];
+  size_t idx = 0;
+
+  while (true) {
+      if (SerialRPC.available()) {
+          char line = (char)SerialRPC.read();
+
+          // Debug echo of raw characters:
+          // Serial.print(line);
+          // On newline, process a complete record
+          if (line == '\n') {
+              // Null-terminate and only accept lines that start with '|'
+              buf[idx] = '\0';
+              if (idx > 0 && buf[0] == '|') {
+                  IMUSample sample;
+                  // Skip the '|' at buf[0]
+                  if (sscanf(buf + 1,
+                             "%ld,%ld,%ld,%ld,%ld,%ld",
+                             &sample.ax, &sample.ay, &sample.az,
+                             &sample.gx, &sample.gy, &sample.gz) == 6) {
+                      // Enqueue into lock-free FIFO
+                      size_t head = imuHead.load();
+                      size_t next = (head + 1) % IMU_BUFFER_SIZE;
+                      imuBuffer[head] = sample;
+                      imuHead.store(next);
+                      // Debug:
+                      // // Serial.println(sample.ax);
+                      // Serial.println(buf + 1); // Print the whole line (excluding '|')
+                      // If buffer full, advance tail (drop oldest)
+                      if (next == imuTail.load()) {
+                          imuTail.store((imuTail.load() + 1) % IMU_BUFFER_SIZE);
+                      }
+                  }
+              }
+              // Reset buffer for next line
+              idx = 0;
+          } else {
+              // Accumulate character (if it fits)
+              if (idx < sizeof(buf) - 1) {
+                  buf[idx++] = line;
+              }
+          }
+      } else {
+          continue;
+      }
+  }
+}
+
+
 
 //================================================================
 // Print function: prints all channel samples at once.
 //================================================================
 void printAllSamples()
 {
+  // Serial.print("ELEC,");
   for (uint8_t i = 0; i < NUM_CHANNELS; i++)
   {
     serialData = (int)(final_channel_data[i] * 0.195);
     Serial.print(serialData);
     if (i < NUM_CHANNELS - 1)
-      Serial.print(", ");
+      Serial.print(",");
   }
-  Serial.println(",550,-550");
+    // Append IMU data from ring buffer or previous sample
+    Serial.print("|");
+    static IMUSample prevSample = {0,0,0,0,0,0};
+    size_t tail = imuTail.load();
+    size_t head = imuHead.load();
+
+    IMUSample s;
+    if (tail != head) {
+        // New sample available
+        s = imuBuffer[tail];
+        imuTail.store((tail + 1) % IMU_BUFFER_SIZE);
+        prevSample = s;  // Update fallback sample
+    } else {
+        // Use last-seen sample when buffer empty
+        s = prevSample;
+    }
+
+    // Serialize and print s (six scaled ints)
+    char imuBuf[120];
+    snprintf(imuBuf, sizeof(imuBuf),
+             "%ld,%ld,%ld,%ld,%ld,%ld",
+             s.ax, s.ay, s.az,
+             s.gx, s.gy, s.gz);
+    Serial.print(imuBuf);  // All in one atomic call
+
+    Serial.println();      // Terminate line
+
+
 }
 
 //================================================================
@@ -341,38 +441,48 @@ void testSPIConnection()
 }
 
 //================================================================
-// I2C Scanner (unchanged)
+// I2C Scanner: scan both Wire and Wire1 buses
 //================================================================
-void scanI2C()
-{
+void scanI2C() {
   byte error, address;
-  int count = 0;
-  Serial.println("Scanning for I2C devices...");
-  for (address = 1; address < 127; address++)
-  {
+  int count0 = 0;
+  Serial.println("Scanning primary I2C bus (Wire) for devices...");
+  for (address = 1; address < 127; address++) {
     Wire.beginTransmission(address);
     error = Wire.endTransmission();
-    if (error == 0)
-    {
-      Serial.print("I2C device found at address 0x");
-      if (address < 16)
-        Serial.print("0");
+    if (error == 0) {
+      Serial.print("Wire device found at 0x");
+      if (address < 16) Serial.print("0");
       Serial.print(address, HEX);
-      Serial.println(" !");
-      count++;
-    }
-    else if (error == 4)
-    {
-      Serial.print("Unknown error at address 0x");
-      if (address < 16)
-        Serial.print("0");
+      Serial.println();
+      count0++;
+    } else if (error == 4) {
+      Serial.print("Wire unknown error at 0x");
+      if (address < 16) Serial.print("0");
       Serial.println(address, HEX);
     }
   }
-  if (count == 0)
-  {
-    Serial.println("No I2C devices found.");
+  if (count0 == 0) Serial.println("No devices found on Wire.");
+
+  int count1 = 0;
+  Serial.println("Scanning secondary I2C bus (Wire1) for devices...");
+  for (address = 1; address < 127; address++) {
+    Wire1.beginTransmission(address);
+    error = Wire1.endTransmission();
+    if (error == 0) {
+      Serial.print("Wire1 device found at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.print(address, HEX);
+      Serial.println();
+      count1++;
+    } else if (error == 4) {
+      Serial.print("Wire1 unknown error at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+    }
   }
+  if (count1 == 0) Serial.println("No devices found on Wire1.");
+
   Serial.println("I2C scan complete.");
 }
 
@@ -387,6 +497,7 @@ void conn(CommandParameter &Parameters)
 
   // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
   sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
+
 }
 
 //================================================================
@@ -401,12 +512,35 @@ void setup()
   Serial.println("Starting simplified connection test...");
   testSPIConnection();
   Wire.begin();
+  Wire1.begin();
   delay(100);
+      // secondary I2C for IMU on SDA1/SCL1
+    if (! imu.begin_I2C(0x6A, &Wire1)) {
+      Serial.println("Failed to find LSM6DS3TR-C on Wire1!");
+      while (1);
+    }
+    
   scanI2C();
   setupCHIP_Timer();
-
   pinMode(D5, OUTPUT);
   digitalWrite(D5, HIGH);
+  bootM4();  
+
+  if (!SerialRPC.begin()) {
+    Serial.println("Failed to initialize SerialRPC!");
+    // handle error…
+  }else {
+    Serial.println("SerialRPC initialized successfully!");
+    Serial.print(SerialRPC.read());
+  }
+
+          
+  // RPC.begin();
+
+  
+  // Start background thread to fetch IMU data from M4
+  static rtos::Thread imuThread(osPriorityNormal, 4*1024);
+  imuThread.start(mbed::callback(imuReceiveTask));
 
   SerialCommandHandler.AddCommand(F("connect"), conn);
 }
@@ -419,8 +553,9 @@ void loop()
   if (!startSerial)
   {
     SerialCommandHandler.Process();
-  }
   // Nothing to do here as printing occurs once a full set of samples is ready.
+  }
+  // ThisThread::sleep_for(1ms);
 }
 
 //================================================================
@@ -436,3 +571,7 @@ uint16_t SendConvertCommand(uint8_t channelnum)
   digitalWrite(chipSelectPin, HIGH);
   return out;
 }
+
+
+#endif // CORE_CM7
+
