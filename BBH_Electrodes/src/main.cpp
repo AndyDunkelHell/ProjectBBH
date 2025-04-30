@@ -11,6 +11,7 @@
 #include "CommandHandler.h"
 #include <atomic>
 #include <SerialRPC.h>
+#include <Adafruit_PWMServoDriver.h>
 
 #define NUM_CHANNELS 12
 int CHANNELS[12] = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14};
@@ -31,6 +32,9 @@ float outBuffer[NUM_CHANNELS][3] = {0};
 // Create an EventQueue and a Ticker (from Mbed OS)
 events::EventQueue queue(32 * EVENTS_EVENT_SIZE);
 mbed::Ticker sampleTicker;
+
+static rtos::Thread eventThread(osPriorityHigh, 16 * 1024);
+static rtos::Thread imuThread(osPriorityNormal, 4 * 1024);
 
 // IMU handling on CM7: lock‑free ring buffer for incoming samples
 struct IMUSample { int32_t ax, ay, az, gx, gy, gz; };
@@ -54,6 +58,18 @@ void printAllSamples();
 CommandHandler<10, 90, 15> SerialCommandHandler;
 
 bool startSerial = false;
+
+const int g6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,50};
+const int g7[16] = {180,180,0,180,180,0,180,180,0,180,180,0,180,180,0,0};
+static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+
+const int SERVOMIN = 125;
+const int SERVOMAX = 600;
+const int SERVONUM = 16;
+
+std::vector<int> pendingPrintIds;
+
 
 //================================================================
 // Notch filter (unchanged)
@@ -222,8 +238,6 @@ void imuReceiveTask() {
       }
   }
 }
-
-
 
 //================================================================
 // Print function: prints all channel samples at once.
@@ -490,14 +504,77 @@ void conn(CommandParameter &Parameters)
 {
   Serial.println("Connected");
   startSerial = true;
-  // Create a thread for the event queue
-  static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
-  eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
-  Serial.println("Event thread started");
-
   // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
   sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
+  Serial.println("Ticker attached, sampling started.");
 
+}
+
+void Disconn(CommandParameter &parameters){
+
+  Serial.println(F("OK"));
+
+  sampleTicker.detach();
+
+  
+}
+  
+  
+void BBHIdentity(CommandParameter &parameters){
+  Serial.println(F("BBH_Portenta \r")); 
+  }
+
+  int angleToPulse(int ang){
+    int pulse = map(ang, 0, 190, SERVOMIN, SERVOMAX);
+    return pulse;
+  }
+  int angleToPulseCMC(int ang){
+    int pulse = map(ang, 70, 50, 250, 500);
+    return pulse;
+  }
+  
+  int angleToPulseinv(int ang){
+    int pulse = map(ang, 190, 0, SERVOMIN, SERVOMAX);
+    return pulse;
+  }
+  
+
+void UpdateDeg(CommandParameter &parameters){
+
+  int ang0 = parameters.NextParameterAsInteger();
+  pwm.setPWM(0,0,angleToPulseinv(ang0));
+  int ang1 = parameters.NextParameterAsInteger();
+  pwm.setPWM(1,0,angleToPulse(ang1));
+  int ang2 = parameters.NextParameterAsInteger();
+  pwm.setPWM(2,0,angleToPulse(ang2));
+  int ang3 = parameters.NextParameterAsInteger();
+  pwm.setPWM(3,0,angleToPulse(ang3));
+  int ang4 = parameters.NextParameterAsInteger();
+  pwm.setPWM(4,0,angleToPulse(ang4));
+  int ang5 = parameters.NextParameterAsInteger();
+  pwm.setPWM(5,0,angleToPulse(ang5));
+  int ang6 = parameters.NextParameterAsInteger();
+  pwm.setPWM(6,0,angleToPulse(ang6));
+  int ang7 = parameters.NextParameterAsInteger();
+  pwm.setPWM(7,0,angleToPulse(ang7));
+  int ang8 = parameters.NextParameterAsInteger();
+  pwm.setPWM(8,0,angleToPulse(ang8));
+  int ang9 = parameters.NextParameterAsInteger();
+  pwm.setPWM(9,0,angleToPulse(ang9));
+  int ang10 = parameters.NextParameterAsInteger();
+  pwm.setPWM(10,0,angleToPulse(ang10));
+  int ang11 = parameters.NextParameterAsInteger();
+  pwm.setPWM(11,0,angleToPulse(ang11));
+  int ang12 = parameters.NextParameterAsInteger();
+  pwm.setPWM(12,0,angleToPulse(ang12));
+  int ang13 = parameters.NextParameterAsInteger();
+  pwm.setPWM(13,0,angleToPulse(ang13));
+  int ang14 = parameters.NextParameterAsInteger();
+  pwm.setPWM(14,0,angleToPulse(ang14));
+  int ang15 = parameters.NextParameterAsInteger();
+  pwm.setPWM(15,0,angleToPulseCMC(ang15));
+  //Serial.println("g"+String(ang0));
+  
 }
 
 //================================================================
@@ -531,18 +608,20 @@ void setup()
     // handle error…
   }else {
     Serial.println("SerialRPC initialized successfully!");
-    Serial.print(SerialRPC.read());
   }
 
+  // Create a thread for the event queue
+  // static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
+  eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
+  // Start background thread to fetch IMU data from M4
+  // static rtos::Thread imuThread(osPriorityNormal, 4*1024);
+  imuThread.start(mbed::callback(imuReceiveTask));
           
   // RPC.begin();
-
-  
-  // Start background thread to fetch IMU data from M4
-  static rtos::Thread imuThread(osPriorityNormal, 4*1024);
-  imuThread.start(mbed::callback(imuReceiveTask));
-
   SerialCommandHandler.AddCommand(F("connect"), conn);
+  SerialCommandHandler.AddCommand(F("DC"), Disconn);
+  SerialCommandHandler.AddCommand(F("UD"), UpdateDeg);
+  SerialCommandHandler.AddCommand(F("identity"), BBHIdentity);
 }
 
 //================================================================
@@ -550,12 +629,10 @@ void setup()
 //================================================================
 void loop()
 {
-  if (!startSerial)
-  {
-    SerialCommandHandler.Process();
-  // Nothing to do here as printing occurs once a full set of samples is ready.
-  }
-  // ThisThread::sleep_for(1ms);
+  // if (!startSerial)
+  // {
+  SerialCommandHandler.Process();
+  // }
 }
 
 //================================================================

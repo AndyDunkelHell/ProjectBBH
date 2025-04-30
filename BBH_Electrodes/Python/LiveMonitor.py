@@ -33,6 +33,10 @@ snr_label = None
 # Global for controlling metrics storage rate (once per second)
 last_metrics_store_time = 0
 
+ser = None
+read_thread = None
+
+
 ########################
 # Filtering Functions  #
 ########################
@@ -119,23 +123,23 @@ def moving_average(signal, window_size=5):
     return smoothed
 
 # Serial reading function (runs in a separate thread)
-def read_serial_data(port="COM4", baud=250000):
-    global running, data_buffer, record_file
+def read_serial_data():
+    global running, data_buffer, record_file, ser
         # This will hold the last-seen IMU reading
     latest_imu = None
-    try:
-        ser = serial.Serial(port, baud, timeout=1)
-        ser.write('!connect\r'.encode())
-        # in_line = ser.readline().decode()
+    # try:
+    #     ser = serial.Serial(port, baud, timeout=1)
+    #     ser.write('!connect\r'.encode())
+    #     # in_line = ser.readline().decode()
         
-    except Exception as e:
-        print("Error opening serial port:", e)
-        return
+    # except Exception as e:
+    #     print("Error opening serial port:", e)
+    #     return
     while running:
         try:
             # Read a line and parse it (expecting comma-separated floats)
             line = ser.readline().decode('utf-8', errors='replace').strip()
-            # print(line)
+            print(line)
             if not line:
                 continue
             parts = line.split('|')
@@ -166,42 +170,87 @@ def read_serial_data(port="COM4", baud=250000):
                     record_file.write(','.join(parts) + '\n')
         except Exception as e:
             print("Error reading/parsing data:", e)
-    ser.close()
+    # ser.write('!DC\r'.encode())
+    # ser.close()
+
 
     if record_file is not None:
         record_file.close()
 
 # Button callback: start the feed
 def start_feed():
-    global running, record_file, last_metrics_store_time, metrics_file
-    if not running:
-        running = True
-        # Start the serial reading in a new daemon thread
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        r_filename = f"emg_dataLog_{now_str}.csv"
-        record_file = open(r_filename, 'w')
+    global running, record_file, last_metrics_store_time, metrics_file, ser, read_thread
+    if running:
+        return
+    # 1) open the port
+    try:
+        ser = serial.Serial("COM4", 250000, timeout=1,
+                            dsrdtr=False, rtscts=False)  # disable hardware handshakes
+        time.sleep(2)                                     # wait for USB-CDC stabilization :contentReference[oaicite:9]{index=9}
+        ser.reset_input_buffer()                          # clear stale data
+        ser.reset_output_buffer()
+        ser.write(b'!connect\r')    
+    except Exception as e:
+        print("Error opening serial port:", e)
+        return
+    
+    running = True
+    # Start the serial reading in a new daemon thread
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    r_filename = f"emg_dataLog_{now_str}.csv"
+    record_file = open(r_filename, 'w')
 
-        metrics_filename = f"Metrics_{now_str}.csv"
-        metrics_file = open(metrics_filename, "w")
-        # Write header for metrics file
-        metrics_file.write("Timestamp;")
-        metrics_file.write("\n")
-        last_metrics_store_time = time.time()
+    metrics_filename = f"Metrics_{now_str}.csv"
+    metrics_file = open(metrics_filename, "w")
+    # Write header for metrics file
+    metrics_file.write("Timestamp;")
+    metrics_file.write("\n")
+    last_metrics_store_time = time.time()
 
-        threading.Thread(target=read_serial_data, daemon=True).start()
-        print(f"Started data feed from serial port. Recording to {r_filename}")
+    read_thread = threading.Thread(target=read_serial_data, daemon=True)
+    read_thread.start()
+    
+    print(f"Started data feed from serial port. Recording to {r_filename}")
 
 
 # Button callback: stop the feed
 def stop_feed():
-    global running
+    global running, ser, read_thread, record_file, metrics_file
+    if not running:
+        return
+
+    # 1) tell the board to stop streaming
+    try:
+        ser.write(b'!DC\r')
+    except Exception as e:
+        print("Error sending DC command:", e)
+
+    # 2) stop the reader loop
     running = False
-    print("Stopped data feed.")
-        # Files are closed in read_serial_data and here if still open
-    if record_file is not None:
+    # 3) wait for thread to finish
+    if read_thread is not None:
+        read_thread.join(timeout=1.0)
+
+    # 4) close files
+    if record_file:
         record_file.close()
-    if metrics_file is not None:
+    if metrics_file:
         metrics_file.close()
+
+    # 5) close serial port
+    try:
+        time.sleep(0.1)                       # allow command to flush :contentReference[oaicite:5]{index=5}
+        ser.reset_input_buffer()              # drop any incoming data
+        ser.reset_output_buffer()             # discard any outgoing data
+        ser.close()                           # close port handle
+        time.sleep(0.5)   
+    except:
+        pass
+
+    ser = None
+    read_thread = None
+
+    print("Stopped data feed.")
 
 # Button callback: toggle metric computation/display
 def toggle_metrics():
