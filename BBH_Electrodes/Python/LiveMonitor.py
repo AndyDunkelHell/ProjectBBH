@@ -18,7 +18,7 @@ toggle_metric = False   # Flag for toggling testing metric calculations
 data_buffer = np.empty((0, NUM_CH))  # Buffer for incoming data (assumes NUM_CH channels)
 record_file = None
 metrics_file = None
-_COM_PORT = "COM4"  # Serial port for the Arduino (change as needed)
+_COM_PORT = "COM3"  # Serial port for the Arduino (change as needed)
 
 # Variables for channel toggles and RMS labels
 channel_vars = []  # Tkinter BooleanVars for each channel's display toggle
@@ -498,7 +498,7 @@ def open_servo_window(root):
         row = i % 4  # Determine the row (0-3)
         col = i // 4  # Determine the column (0-3)
         s = tk.Scale(sliders,
-                     from_=0, to=190,
+                     from_=80, to=190,
                      orient='vertical',
                      variable=vals[i],
                      command=lambda v, idx=i: send_all(idx, v),
@@ -538,7 +538,7 @@ for ch in range(NUM_CH):
 
 ax.set_xlim(0, 500)  # Display last 1000 samples on X-axis
 
-ax.set_ylim(-5000, 5000)
+ax.set_ylim(-500, 500)
 #ax.set_ylim(-4000, 4000000)
 
 ax.set_xlabel("Sample")

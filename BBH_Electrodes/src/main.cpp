@@ -45,6 +45,11 @@ std::atomic<size_t> imuHead(0), imuTail(0);
 // IMU instance on secondary I2C bus (Wire1)
 extern TwoWire Wire1;
 Adafruit_LSM6DS3TRC imu;
+bool IMU_board = false;
+  
+
+// BoardMode: true for EMG+IMU data collection, false for prediction Mode
+volatile bool boardMode = false; // Flag for EMG mode
 
 extern TwoWire Wire2; // I2C bus for the PWM driver (Adafruit_PWMServoDriver)
 bool servo_board = false;
@@ -68,6 +73,27 @@ const int SERVOMIN = 125;
 const int SERVOMAX = 575;
 const int SERVONUM = 16;
 
+static float emg_buf[512][12];
+static int   buf_idx = 0;
+
+struct PacketHeader {
+  uint8_t  sync;     // fixed magic, e.g. 0xAA
+  uint8_t  type;     // 0 = EMG, 1 = IMU, 2 = CTRL, …
+  uint16_t seq;      // monotonically increasing
+  uint16_t len;      // payload length in bytes (so you can vary it)
+};
+
+// type-0 payload:
+struct EmgPayload {
+  int16_t values[12];
+};
+
+struct EmgPacket { 
+  int16_t values[12]; 
+};
+
+
+static uint16_t seq_counter = 0;
 //================================================================
 // Notch filter (unchanged)
 //================================================================
@@ -120,7 +146,7 @@ void spiSampleTask()
   if (flushing)
   {
     // Issue a dummy conversion command for the channel at currentChannelIndex.
-    SendConvertCommandH(CHANNELS[currentChannelIndex]);
+    SendConvertCommand(CHANNELS[currentChannelIndex]);
     // Move to the next channel index (wrap around).
     currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
     flushCounter++;
@@ -190,13 +216,28 @@ void spiSampleTask()
 void imuReceiveTask() {
   static char buf[80];
   size_t idx = 0;
+  int32_t       predicted = -1;
 
   while (true) {
+    if(boardMode){
+      
+      if (SerialRPC.available()) {
+        
+        char line = (char)SerialRPC.read();
+        // Debug echo of raw characters:
+        Serial.print(line);
+        // SerialRPC.readBytes((char*)&predicted, sizeof(predicted));
+
+        // Serial.print(F("Predicted class: "));
+        // Serial.println(predicted);
+        
+      }
+      continue;
+    }
       if (SerialRPC.available()) {
           char line = (char)SerialRPC.read();
-
           // Debug echo of raw characters:
-          // Serial.print(line);
+          Serial.print(line);
           // On newline, process a complete record
           if (line == '\n') {
               // Null-terminate and only accept lines that start with '|'
@@ -236,48 +277,86 @@ void imuReceiveTask() {
   }
 }
 
+void listenM4(CommandParameter &parameters)
+{
+  Serial.println(F("Listening to M4"));
+  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
+  if(SerialRPC.available()){
+    Serial.println(F("SerialRPC available"));
+    char line = (char)SerialRPC.read();
+    // Debug echo of raw characters:
+    Serial.print(line);
+  }
+}
+
 //================================================================
 // Print function: prints all channel samples at once.
 //================================================================
 void printAllSamples()
 {
-  // Serial.print("ELEC,");
-  for (uint8_t i = 0; i < NUM_CHANNELS; i++)
-  {
-    serialData = (int)(final_channel_data[i] * 0.195);
-    Serial.print(serialData);
-    if (i < NUM_CHANNELS - 1)
-      Serial.print(",");
-  }
-    // Append IMU data from ring buffer or previous sample
-    Serial.print("|");
-    static IMUSample prevSample = {0,0,0,0,0,0};
-    size_t tail = imuTail.load();
-    size_t head = imuHead.load();
-
-    IMUSample s;
-    if (tail != head) {
-        // New sample available
-        s = imuBuffer[tail];
-        imuTail.store((tail + 1) % IMU_BUFFER_SIZE);
-        prevSample = s;  // Update fallback sample
-    } else {
-        // Use last-seen sample when buffer empty
-        s = prevSample;
+  // EMG+IMU sampling mode
+  if(!boardMode){
+    // Serial.print("ELEC,");
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++)
+    {
+      serialData = (int)(final_channel_data[i] * 0.195);
+      Serial.print(serialData);
+      if (i < NUM_CHANNELS - 1)
+        Serial.print(",");
     }
+      // Append IMU data from ring buffer or previous sample
+      Serial.print("|");
+      static IMUSample prevSample = {0,0,0,0,0,0};
+      size_t tail = imuTail.load();
+      size_t head = imuHead.load();
 
-    // Serialize and print s (six scaled ints)
-    char imuBuf[120];
-    snprintf(imuBuf, sizeof(imuBuf),
-             "%ld,%ld,%ld,%ld,%ld,%ld",
-             s.ax, s.ay, s.az,
-             s.gx, s.gy, s.gz);
-    Serial.print(imuBuf);  // All in one atomic call
+      IMUSample s;
+      if (tail != head) {
+          // New sample available
+          s = imuBuffer[tail];
+          imuTail.store((tail + 1) % IMU_BUFFER_SIZE);
+          prevSample = s;  // Update fallback sample
+      } else {
+          // Use last-seen sample when buffer empty
+          s = prevSample;
+      }
 
-    Serial.println();      // Terminate line
+      // Serialize and print s (six scaled ints)
+      char imuBuf[120];
+      snprintf(imuBuf, sizeof(imuBuf),
+              "%ld,%ld,%ld,%ld,%ld,%ld",
+              s.ax, s.ay, s.az,
+              s.gx, s.gy, s.gz);
+      Serial.print(imuBuf);  // All in one atomic call
 
+      Serial.println();      // Terminate line
+      return;
+
+    }
+    // Prediction mode: buffer 512 EMG samples
+
+      EmgPacket pkt;
+      for(int ch=0; ch<12; ch++) 
+        pkt.values[ch] = final_channel_data[ch];
+      SerialRPC.write((uint8_t*)&pkt, sizeof(pkt));
+
+      PacketHeader hdr;
+      hdr.sync = 0xAA;
+      hdr.type = 0;                     // EMG
+      hdr.seq  = seq_counter++;
+      hdr.len  = sizeof(EmgPayload);
+
+      EmgPayload payload;
+      for (int ch = 0; ch < 12; ch++)
+        payload.values[ch] = final_channel_data[ch];
+
+      // write header + payload in one go:
+      SerialRPC.write((uint8_t*)&hdr,     sizeof(hdr));
+      SerialRPC.write((uint8_t*)&payload, sizeof(payload));
 
 }
+
+
 
 //================================================================
 // SPI command functions (unchanged)
@@ -342,47 +421,38 @@ void timerCallback()
 //================================================================
 // Powering channels: using registers 14 and 15 (unchanged)
 //================================================================
+
 void SetAllAmpPwr()
 {
-  uint8_t previousreg14, previousreg15;
-
+  // — Read & flush register 14 twice, then grab its current value
   SendReadCommand(14);
   SendReadCommand(14);
-  previousreg14 = SendReadCommand(14);
+  uint8_t mask14 = SendReadCommand(14);
+
+  // — Read & flush register 15 twice, then grab its current value
   SendReadCommand(15);
   SendReadCommand(15);
-  previousreg15 = SendReadCommand(15);
+  uint8_t mask15 = SendReadCommand(15);
 
-  int final_channel = CHANNELS[NUM_CHANNELS - 1];
+  // — Always power reference electrodes 0 and 15
+  mask14 |= (1 << 0);         // channel 0
+  mask15 |= (1 << (15 - 8));  // channel 15
 
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
+  // — Now power your active channels (those in CHANNELS[], which already excludes 0 & 15)
+  for (uint8_t i = 0; i < NUM_CHANNELS; i++)
   {
-    if (CHANNELS[ch] == final_channel)
-    {
-      if (CHANNELS[ch] < 8)
-      {
-        SendWriteCommand(14, (1 << CHANNELS[ch]) | previousreg14);
-      }
-      else if (CHANNELS[ch] >= 8)
-      {
-        SendWriteCommand(15, (1 << abs(CHANNELS[ch] - 8)) | previousreg15);
-      }
-    }
+    uint8_t ch = CHANNELS[i];
+    if (ch < 8)
+      mask14 |= (1 << ch);
     else
-    {
-      if (CHANNELS[ch] < 8)
-      {
-        SendWriteCommand(14, (1 << CHANNELS[ch]) | previousreg14);
-        previousreg14 = (1 << CHANNELS[ch]) | previousreg14;
-      }
-      else if (CHANNELS[ch] >= 8)
-      {
-        SendWriteCommand(15, (1 << abs(CHANNELS[ch] - 8)) | previousreg15);
-        previousreg15 = (1 << abs(CHANNELS[ch] - 8)) | previousreg15;
-      }
-    }
+      mask15 |= (1 << (ch - 8));
   }
+
+  // — Write back exactly once per register
+  SendWriteCommand(14, mask14);
+  SendWriteCommand(15, mask15);
 }
+
 
 //================================================================
 // CHIP Timer setup and register initialization (mostly unchanged)
@@ -402,13 +472,26 @@ void setupCHIP_Timer()
   SendWriteCommand(10, 43);
   SendWriteCommand(11, 6);
 
-  uint8_t RL = 0, RLDAC1 = 5;
-  uint8_t ADCaux3en = 0, RLDAC3 = 0, RLDAC2 = 1;
-  uint8_t R12 = ((RL << 7) | RLDAC1);
-  uint8_t R13 = (ADCaux3en << 7) | (RLDAC3 << 6) | RLDAC2;
+
+  // RL = 0 → internal bias-drive off (we’re using an external reference electrode)
+  // RLDAC1 = 0 → no DAC output on Jack 1
+  uint8_t RL       = 0;
+  uint8_t RLDAC1   = 0;
+
+  // ADCaux3en = 0 → don’t enable the aux ADC onboard
+  // RLDAC3   = 0 → no DAC output on Jack 3
+  // RLDAC2   = 0 → no DAC output on Jack 2
+  uint8_t ADCaux3en = 0,
+          RLDAC3    = 0,
+          RLDAC2    = 0;
+
+  // build the two bytes exactly as the datasheet wants:
+  uint8_t R12 = (RL << 7) | (RLDAC1 & 0x7F);
+  uint8_t R13 = (ADCaux3en << 7) | (RLDAC3 << 6) | (RLDAC2 << 5);
+
+  // write them out to the Intan
   SendWriteCommand(12, R12);
   SendWriteCommand(13, R13);
-
   SendWriteCommand(14, 0b00000000);
   SendWriteCommand(15, 0b00000000);
 
@@ -537,8 +620,8 @@ void BBHIdentity(CommandParameter &parameters){
   Serial.println(F("BBH_Portenta \r")); 
   }
 
-  int angleToPulse(int ang){
-    int pulse = map(ang, 0, 190, SERVOMIN, SERVOMAX);
+  int angleToPulseinv(int ang){
+    int pulse = map(ang, 190, 80, SERVOMIN, SERVOMAX);
     return pulse;
   }
   int angleToPulseCMC(int ang){
@@ -546,8 +629,8 @@ void BBHIdentity(CommandParameter &parameters){
     return pulse;
   }
   
-  int angleToPulseinv(int ang){
-    int pulse = map(ang, 190, 0, SERVOMIN, SERVOMAX);
+  int angleToPulse(int ang){
+    int pulse = map(ang, 80, 190, SERVOMIN, SERVOMAX);
     return pulse;
   }
   
@@ -559,15 +642,15 @@ void UpdateDeg(CommandParameter &parameters){
 
   int ang0 = parameters.NextParameterAsInteger();
   Serial.print(ang0);
-  pwm.setPWM(0,0,angleToPulseinv(ang0));
+  pwm.setPWM(0,0,angleToPulse(ang0));
   int ang1 = parameters.NextParameterAsInteger();
   pwm.setPWM(1,0,angleToPulse(ang1));
   int ang2 = parameters.NextParameterAsInteger();
-  pwm.setPWM(2,0,angleToPulse(ang2));
+  pwm.setPWM(2,0,angleToPulseinv(ang2));
   int ang3 = parameters.NextParameterAsInteger();
   pwm.setPWM(3,0,angleToPulse(ang3));
   int ang4 = parameters.NextParameterAsInteger();
-  pwm.setPWM(4,0,angleToPulse(ang4));
+  pwm.setPWM(4,0,angleToPulseinv(ang4));
   int ang5 = parameters.NextParameterAsInteger();
   pwm.setPWM(5,0,angleToPulse(ang5));
   int ang6 = parameters.NextParameterAsInteger();
@@ -579,19 +662,46 @@ void UpdateDeg(CommandParameter &parameters){
   int ang9 = parameters.NextParameterAsInteger();
   pwm.setPWM(9,0,angleToPulse(ang9));
   int ang10 = parameters.NextParameterAsInteger();
-  pwm.setPWM(10,0,angleToPulse(ang10));
+  pwm.setPWM(10,0,angleToPulseinv(ang10));
   int ang11 = parameters.NextParameterAsInteger();
   pwm.setPWM(11,0,angleToPulse(ang11));
   int ang12 = parameters.NextParameterAsInteger();
   pwm.setPWM(12,0,angleToPulse(ang12));
   int ang13 = parameters.NextParameterAsInteger();
-  pwm.setPWM(13,0,angleToPulse(ang13));
+  pwm.setPWM(13,0,angleToPulseinv(ang13));
   int ang14 = parameters.NextParameterAsInteger();
   pwm.setPWM(14,0,angleToPulse(ang14));
   int ang15 = parameters.NextParameterAsInteger();
-  pwm.setPWM(15,0,angleToPulseCMC(ang15));
+  pwm.setPWM(15,0,angleToPulseinv(ang15));
   //Serial.println("g"+String(ang0));
   
+}
+
+void connConfirm(CommandParameter &parameters)
+{
+  Serial.println(F("OK"));
+  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
+  Serial.println("Ready to receive data");
+}
+
+void modeSwitch(CommandParameter &parameters)
+{
+  if (boardMode)
+  {
+    boardMode = false;
+    Serial.println(F("EMG+IMU sampling mode"));
+    uint8_t code = 0x00;
+    SerialRPC.write(&code, 1);
+    
+  }
+  else
+  {
+    boardMode = true;
+    uint8_t code = 0x01;
+    Serial.println(F("Prediction mode"));
+    SerialRPC.write(&code, 1);
+    sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
+  }
 }
 
 //================================================================
@@ -609,10 +719,13 @@ void setup()
   Wire1.begin();
   Wire2.begin(); // SDA2/SCL2 for PWM driver
   delay(100);
-      // secondary I2C for IMU on SDA1/SCL1
+    // secondary I2C for IMU on SDA1/SCL1
     if (! imu.begin_I2C(0x6A, &Wire1)) {
       Serial.println("Failed to find LSM6DS3TR-C on Wire1!");
-      while (1);
+      IMU_board = false;
+    }else {
+      Serial.println("Found LSM6DS3TR-C on Wire1!");
+      IMU_board = true;
     }
     
   scanI2C();
@@ -621,7 +734,7 @@ void setup()
   digitalWrite(D5, HIGH);
   bootM4();  
 
-  if (!SerialRPC.begin()) {
+  if (!SerialRPC.begin(460800)) {
     Serial.println("Failed to initialize SerialRPC!");
     // handle error…
   }else {
@@ -633,8 +746,9 @@ void setup()
   eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
   // Start background thread to fetch IMU data from M4
   // static rtos::Thread imuThread(osPriorityNormal, 4*1024);
-  imuThread.start(mbed::callback(imuReceiveTask));
-
+  if (IMU_board) {
+    imuThread.start(mbed::callback(imuReceiveTask));
+  }
   pwm.begin();
   pwm.setPWMFreq(60); // Analog servos run at ~60 Hz updates
   pwm.setOscillatorFrequency(27000000);
@@ -642,10 +756,14 @@ void setup()
           
   // RPC.begin();
   SerialCommandHandler.AddCommand(F("connect"), conn);
+  SerialCommandHandler.AddCommand(F("connected"), connConfirm);
   SerialCommandHandler.AddCommand(F("DC"), Disconn);
   SerialCommandHandler.AddCommand(F("UD"), UpdateDeg);
   SerialCommandHandler.AddCommand(F("identity"), BBHIdentity);
+  SerialCommandHandler.AddCommand(F("mode"), modeSwitch);
+  SerialCommandHandler.AddCommand(F("listen"), listenM4);
 }
+
 
 //================================================================
 // Main loop: now empty – printing is handled by the event queue.
