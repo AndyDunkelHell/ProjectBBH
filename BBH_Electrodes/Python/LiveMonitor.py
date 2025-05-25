@@ -538,7 +538,7 @@ for ch in range(NUM_CH):
 
 ax.set_xlim(0, 500)  # Display last 1000 samples on X-axis
 
-ax.set_ylim(-500, 500)
+ax.set_ylim(-50, 50)
 #ax.set_ylim(-4000, 4000000)
 
 ax.set_xlabel("Sample")

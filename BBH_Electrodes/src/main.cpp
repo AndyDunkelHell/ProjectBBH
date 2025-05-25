@@ -1,80 +1,62 @@
-#ifdef CORE_CM7  // M7 core code handles Intan SPI and RPC reception
-#include <SPI.h>
-#include "mbed.h"
-#include "rtos.h"
-#include "events/EventQueue.h" // For Ticker and EventQueue (from the Portenta Arduino core)
+#ifdef CORE_CM7  
+
 #include <Wire.h>
 #include <Adafruit_LSM6DS3TRC.h>
-#include "RPC.h" 
-#include <Adafruit_Sensor.h>
-#include "stm32h7xx.h" // STM32 registers
+#include "RPC.h"
+#include "rtos.h"
+#include "SerialRPC.h"
+#include <Arduino.h>
+#include "mbed.h"
+#include <TensorFlowLite.h>
+#include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
+#include <tensorflow/lite/micro/tflite_bridge/micro_error_reporter.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+
 #include "CommandHandler.h"
 #include <atomic>
-#include <SerialRPC.h>
 #include <Adafruit_PWMServoDriver.h>
 
-#define NUM_CHANNELS 12
-int CHANNELS[12] = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14};
-
-// Alternatively, you could change the order with:
-// int CHANNELS[12] = {11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1};
-
-const int chipSelectPin = PIN_SPI_SS;
-int serialData = 0;
-
-// Global arrays for raw and filtered data for each channel
-volatile int16_t channel_data[NUM_CHANNELS] = {0};
-volatile int16_t final_channel_data[NUM_CHANNELS] = {0};
-// Buffers for filtering (using float for precision)
-float inBuffer[NUM_CHANNELS][3] = {0};
-float outBuffer[NUM_CHANNELS][3] = {0};
-
-// Create an EventQueue and a Ticker (from Mbed OS)
-events::EventQueue queue(32 * EVENTS_EVENT_SIZE);
-mbed::Ticker sampleTicker;
-
-static rtos::Thread eventThread(osPriorityHigh, 16 * 1024);
-static rtos::Thread imuThread(osPriorityNormal, 4 * 1024);
-
-// IMU handling on CM7: lock‑free ring buffer for incoming samples
-struct IMUSample { int32_t ax, ay, az, gx, gy, gz; };
-constexpr size_t IMU_BUFFER_SIZE = 32;
-IMUSample imuBuffer[IMU_BUFFER_SIZE];
-std::atomic<size_t> imuHead(0), imuTail(0);
-
-// IMU instance on secondary I2C bus (Wire1)
-extern TwoWire Wire1;
-Adafruit_LSM6DS3TRC imu;
-bool IMU_board = false;
-  
-
-// BoardMode: true for EMG+IMU data collection, false for prediction Mode
-volatile bool boardMode = false; // Flag for EMG mode
-
-extern TwoWire Wire2; // I2C bus for the PWM driver (Adafruit_PWMServoDriver)
-bool servo_board = false;
-// Forward declarations of SPI commands and helper functions.
-uint16_t SendConvertCommand(uint8_t channelnum);
-uint16_t SendReadCommand(uint8_t regnum);
-uint16_t SendConvertCommandH(uint8_t channelnum);
-uint16_t SendWriteCommand(uint8_t regnum, uint8_t data);
-void Calibrate();
-void NotchFilter50(uint8_t ch);
-void printAllSamples();
-
+static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40, Wire2);
 CommandHandler<10, 90, 15> SerialCommandHandler;
 
 bool startSerial = false;
+bool initInterp = false; // true if interpreter is initialized
+// Include the TensorFlow Lite model file.
+#include "modelnocls.h"
+#include "test_samples.h"
+// #define Serial SerialRPC 
 
-static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40, Wire2);
+extern TwoWire Wire1;
+Adafruit_LSM6DS3TRC imu;
+bool IMU_board = true; // true if IMU board is present
+using namespace std::chrono_literals;
 
+// Statically allocate error‐reporter, resolver, arena, interpreter:
+static tflite::MicroErrorReporter     error_reporter;
+constexpr int kOpResolverMaxOps = 20;  
+static tflite::MicroMutableOpResolver<kOpResolverMaxOps> resolver;
+constexpr size_t kTensorArenaSize = 150 * 1024;
+uint8_t tensor_arena[kTensorArenaSize]
+    __attribute__((section(".bss.$RAM_D2"), aligned(16)));
+static const tflite::Model* model = tflite::GetModel(model2D_noclsflat_tflite);
+static tflite::MicroInterpreter* interp;
+static TfLiteTensor* input_tensor;
+static TfLiteTensor* output_tensor;
+
+static float window_buf[512][18];
+static float  imu_buf[512][6];
+static int imu_idx = 0; // index for IMU buffer
 
 const int SERVOMIN = 125;
 const int SERVOMAX = 575;
 const int SERVONUM = 16;
+bool servo_board = false; // true if servo board is present
 
-static float emg_buf[512][12];
-static int   buf_idx = 0;
+static int N_CLASSES = 4; // number of classes in the model
+
+struct EmgPacket { 
+  int16_t values[12]; 
+};
 
 struct PacketHeader {
   uint8_t  sync;     // fixed magic, e.g. 0xAA
@@ -88,478 +70,432 @@ struct EmgPayload {
   int16_t values[12];
 };
 
-struct EmgPacket { 
-  int16_t values[12]; 
-};
+// Thread handle
+static rtos::Thread rpcThread(osPriorityNormal, 16 * 1024); 
+                                       // 16 KB stack for safety
 
+// Forward declarations
+void initInterpreter();
+void rpcReceiveTask();
 
-static uint16_t seq_counter = 0;
-//================================================================
-// Notch filter (unchanged)
-//================================================================
-void NotchFilter50(uint8_t ch)
-{
-  // Shift previous inputs
-  inBuffer[ch][0] = inBuffer[ch][1];
-  inBuffer[ch][1] = inBuffer[ch][2];
-  inBuffer[ch][2] = channel_data[ch];
-
-  // Apply the IIR notch filter equation
-  outBuffer[ch][2] = 0.9696f * inBuffer[ch][0] - 1.8443f * inBuffer[ch][1] + 0.9696f * inBuffer[ch][2] - 0.9391f * outBuffer[ch][0] + 1.8442f * outBuffer[ch][1];
-
-  // Shift previous outputs
-  outBuffer[ch][0] = outBuffer[ch][1];
-  outBuffer[ch][1] = outBuffer[ch][2];
-
-  // Store the filtered result
-  final_channel_data[ch] = outBuffer[ch][2];
+extern "C" void DebugLog(const char* s) {
+  if (Serial) { // Check if Serial has been initialized
+    // Serial.print("TFLM_LOG: "); // Add a prefix to distinguish TFLM logs
+    Serial.print(s);
+    // TF_LITE_REPORT_ERROR usually includes a newline in its format string.
+    // If not, add Serial.println() or Serial.print("\n") here.
+  }
 }
+constexpr int   MA_WINDOW = 15;
+constexpr float norm_mean[18] = {
+ 1.7510592e-05f, -6.5103150e-06f,  8.5237180e-06f,  3.6101002e-05f,
+  2.5973031e-05f,  4.0530118e-05f,  1.5493080e-05f, 2.5338548e-05f,
+  3.8996986e-05f,  2.0694490e-05f,  1.0160831e-05f,  1.0710345e-05f,
+  9.9831186e-06f,  6.5045087e-06f, -4.3529295e-07f, -4.4205347e-08f,
+  3.8402288e-07f,  2.3899187e-07f};
+constexpr float norm_std[18] = {0.9995055f,  1.0012661f,  1.0012894f,  0.9988487f,  0.99982405f, 0.99965686f,
+ 0.9998318f,  0.99919933f, 1.0000762f,  0.9996321f,  0.9992363f,  1.000127f,
+ 0.99999887f, 1.0000004f,  0.99999005f, 1.0000004f,  1.0000037f,  1.0000271f};
+//––– per‐channel TKE‐MA state:
+float win3[12][3] = {0};              // rolling 3‐point buffer
+float tke_sum[12] = {0};              // running sum over MA_WINDOW
+float tke_hist[12][MA_WINDOW] = {0};  // circular history
+int   tke_idx[12] = {0};              // insert ptr per channel
 
-void noNotchFilter(uint8_t ch)
+bool inferenceRun = false; // true if inference is running
+void processSample(const int16_t raw_emg[12], const float imu[6],
+                   float out_feat[18])
 {
-  final_channel_data[ch] = channel_data[ch];
-}
-//================================================================
-// SPI sampling task with pipeline delay handling and queue‐based printing
-//================================================================
-void spiSampleTask()
-{
-  // For a 3-command delay:
-  const int pipelineDelay = 2;
-  // Total number of dummy (flush) commands required:
-  const int flushCommands = NUM_CHANNELS + pipelineDelay;
+  // 1) TKE & MA
+  for(int ch=0; ch<12; ++ch){
+    // shift 3‐point window
+    win3[ch][0] = win3[ch][1];
+    win3[ch][1] = win3[ch][2];
+    win3[ch][2] = raw_emg[ch];
+    // compute TKE
+    float tke = win3[ch][1]*win3[ch][1]
+              - win3[ch][0]*win3[ch][2];
+    // subtract oldest, add new
+    tke_sum[ch] -= tke_hist[ch][tke_idx[ch]];
+    tke_hist[ch][tke_idx[ch]] = tke;
+    tke_sum[ch] += tke;
+    // advance circular index
+    if(++tke_idx[ch] >= MA_WINDOW) tke_idx[ch] = 0;
+    // moving average
+    float ma = tke_sum[ch] / float(MA_WINDOW);
 
-  // Static variables to control flush vs. normal operation.
-  static bool flushing = true; // Start in flush mode.
-  static int flushCounter = 0; // Count dummy commands issued.
-
-  // Variables for normal operation (after flush is complete):
-  static bool pipelineInitialized = false;
-  // pipelineQueue will hold channel indices (0 to NUM_CHANNELS-1)
-  static uint8_t pipelineQueue[pipelineDelay];
-  static uint8_t currentChannelIndex = 0; // Next channel index (0...NUM_CHANNELS-1) to issue a command for.
-  static uint8_t sampleCounter = 0;       // Count how many valid samples have been processed.
-
-  //------------------------------------------------------------------
-  // FLUSH PHASE: Issue dummy conversion commands to fill the pipeline.
-  //------------------------------------------------------------------
-  if (flushing)
-  {
-    // Issue a dummy conversion command for the channel at currentChannelIndex.
-    SendConvertCommand(CHANNELS[currentChannelIndex]);
-    // Move to the next channel index (wrap around).
-    currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
-    flushCounter++;
-    // When we've issued flushCommands dummy commands, initialize the pipeline.
-    if (flushCounter >= flushCommands)
-    {
-      flushing = false;
-      // Fill the pipelineQueue with the channel indices that correspond to the last 'pipelineDelay' commands.
-      for (int i = flushCommands - pipelineDelay; i < flushCommands; i++)
-      {
-        // Instead of storing CHANNELS[i % NUM_CHANNELS],
-        // store the channel index (i % NUM_CHANNELS).
-        pipelineQueue[i - (flushCommands - pipelineDelay)] = i % NUM_CHANNELS;
-      }
-      pipelineInitialized = true;
-    }
-    return; // Don't process any result during flushing.
+    // 2) normalize EMG feature
+    out_feat[ch] = (ma - norm_mean[ch]) / norm_std[ch];
   }
 
-  // Safety check (should never happen)
-  if (!pipelineInitialized)
-  {
+  // 3) normalize IMU features
+  for(int k=0; k<6; ++k){
+    out_feat[12 + k] = (imu[k] - norm_mean[12 + k]) / norm_std[12 + k];
+  }
+}
+
+void LogMyAppMessage(const char* format, ...) {
+  if (!Serial) { // Don't try to log if Serial isn't ready
     return;
   }
 
-  //------------------------------------------------------------------
-  // NORMAL OPERATION: Process conversion results in a round-robin manner.
-  //------------------------------------------------------------------
-  // Issue a conversion command for the current channel.
-  uint16_t newResult = SendConvertCommandH(CHANNELS[currentChannelIndex]);
+  char buffer[256]; // Or a larger buffer if you expect very long messages
+  va_list args;
+  va_start(args, format);
+  // Format the string into the buffer
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
 
-  // The returned result corresponds to the channel at the head of the pipeline.
-  uint8_t channelIndexToProcess = pipelineQueue[0];
-
-  // Shift the pipelineQueue one position to the left.
-  for (int i = 0; i < pipelineDelay - 1; i++)
-  {
-    pipelineQueue[i] = pipelineQueue[i + 1];
-  }
-  // Append the current channel index at the end of the pipeline.
-  pipelineQueue[pipelineDelay - 1] = currentChannelIndex;
-
-  // Update currentChannelIndex for next call (wrap around).
-  currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
-
-  // Store the new conversion result into the proper slot.
-  channel_data[channelIndexToProcess] = newResult;
-  // Process the raw data – if you're not filtering, use the noNotchFilter.
-  noNotchFilter(channelIndexToProcess);
-  // NotchFilter50(channelIndexToProcess);
-
-  // Increment the sample counter. When we've processed a full cycle of NUM_CHANNELS samples,
-  // schedule printing of the complete set.
-  sampleCounter++;
-  if (sampleCounter >= NUM_CHANNELS)
-  {
-    queue.call(printAllSamples);
-    sampleCounter = 0;
-  }
-
+  // Pass the already formatted string to the TFLM error reporter
+  // This will then call your DebugLog("TFLM_LOG: " + formatted_string)
+  TF_LITE_REPORT_ERROR(&error_reporter, buffer); 
 }
 
+// Call once in setup():
+void initInterpreter() {
+  Serial.println("M7: initInterpreter - start");
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize);
+  interp = &static_interpreter;
+  Serial.println("M7: initInterpreter - interpreter created.");
+  // interp = new tflite::MicroInterpreter(
+  //   model, resolver, tensor_arena, kTensorArenaSize, &error_reporter
+  // );
+  Serial.println(uintptr_t(tensor_arena) & 0xF);
+  size_t arena_ptr_user  = reinterpret_cast<size_t>(tensor_arena);
+  // size_t arena_ptr_interp= reinterpret_cast<size_t>(interp->arena());
 
-//-----------------------------------------------------------------------------
-// Thread to receive ASCII IMU lines from M4 over RPC and push into ring buffer
-//-----------------------------------------------------------------------------  
-void imuReceiveTask() {
-  static char buf[80];
-  size_t idx = 0;
-  int32_t       predicted = -1;
+  Serial.print("Your arena   @ 0x"); Serial.println(arena_ptr_user, HEX);
+  // Serial.print("Interp arena @ 0x"); Serial.println(arena_ptr_interp, HEX);
+    // interp->SetAllocationInfo(true); 
+
+  TfLiteStatus alloc_status = interp->AllocateTensors();
+  if (alloc_status != kTfLiteOk) {
+    LogMyAppMessage("AllocateTensors() call failed directly with status code: %d. Arena used bytes: %u\n", 
+                    static_cast<int>(alloc_status), 
+                    static_cast<unsigned int>(interp->arena_used_bytes()));
+    // Serial.println(interp->arena_used_bytes());
+    
+    // Serial.print("AllocateTensors() failed: ");
+    
+    while(1);
+  }
+  Serial.println(interp->arena_used_bytes());
+    // 6. Get the input tensor pointer
+  input_tensor = interp->input(0); // Get the first input tensor
+
+  if (input_tensor == nullptr) {
+    Serial.println("M7: initInterpreter - FATAL ERROR: input_tensor is NULL even after AllocateTensors() succeeded!");
+    while(1); // Halt
+  }
+  Serial.println("M7: initInterpreter - input_tensor pointer obtained successfully.");
+
+  output_tensor = interp->output(0);
+  
+  if (output_tensor == nullptr) {
+    Serial.println("M7: initInterpreter - FATAL ERROR: output_tensor is NULL even after AllocateTensors() succeeded!");
+    while(1); // Halt
+  }
+  initInterp = true; // Interpreter is initialized
+}
+
+// New function to run inference on a single test sample
+void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const char* sample_name, int expected_label) {
+  if (interp == nullptr || input_tensor == nullptr || output_tensor == nullptr) {
+    // global_error_reporter.Report("Interpreter not initialized for test inference!");
+    Serial.println("ERROR: Interpreter not ready for test inference.");
+    return;
+  }
+
+  Serial.print("Running test inference for: ");
+  Serial.print(sample_name);
+  Serial.print(" (Expected Label: ");
+  Serial.print(expected_label);
+  Serial.println(")");
+    // Inside run_test_inference, before copying to input_tensor
+  Serial.print("Sample data check [0][0]: "); Serial.println(sample_data[0][0], 6);
+  Serial.print("Sample data check [10][5]: "); Serial.println(sample_data[10][5], 6);
+  Serial.print("Sample data check [MAX-1][MAX-1]: "); Serial.println(sample_data[TEST_SAMPLE_WINDOW_SIZE-1][TEST_SAMPLE_N_CHANNELS-1], 6);
+
+  // 1. Copy test sample data to the input tensor
+  // Assuming float32 input. If your model is int8 input, this needs to change.
+  if (input_tensor->type == kTfLiteFloat32) {
+    // Check dimensions
+    if (input_tensor->dims->size != 3 || // Should be [1, WINDOW_SIZE, N_CHANNELS]
+        input_tensor->dims->data[0] != 1 ||
+        input_tensor->dims->data[1] != TEST_SAMPLE_WINDOW_SIZE ||
+        input_tensor->dims->data[2] != TEST_SAMPLE_N_CHANNELS) {
+      // global_error_reporter.Report("Test sample dimensions mismatch with input tensor!");
+      Serial.print("ERROR: Test sample dimensions: [1][");
+      Serial.print(TEST_SAMPLE_WINDOW_SIZE);
+      Serial.print("][");
+      Serial.print(TEST_SAMPLE_N_CHANNELS);
+      Serial.print("] do not match input tensor: [");
+      Serial.print(input_tensor->dims->data[0]);
+      Serial.print("][");
+      Serial.print(input_tensor->dims->data[1]);
+      Serial.print("][");
+      Serial.print(input_tensor->dims->data[2]);
+      Serial.println("]");
+      return;
+    }
+    
+    // Flatten the 2D sample_data array for memcpy or element-wise copy
+      for (int t = 0; t < TEST_SAMPLE_WINDOW_SIZE; ++t) {
+        for (int c = 0; c < TEST_SAMPLE_N_CHANNELS; ++c) {
+            input_tensor->data.f[t * TEST_SAMPLE_N_CHANNELS + c] = sample_data[t][c];
+        }
+    }  
+    // Or using memcpy if you are sure about layout and sizes:
+    // memcpy(input_tensor->data.f, sample_data, TEST_SAMPLE_WINDOW_SIZE * TEST_SAMPLE_N_CHANNELS * sizeof(float));
+
+  } else if (input_tensor->type == kTfLiteInt8) {
+    // global_error_reporter.Report("Input tensor is int8. Test sample data is float. Quantization needed for test samples.");
+    Serial.println("ERROR: Input tensor is int8, but test samples are float. Implement quantization for test samples.");
+    // TODO: If your model input is int8, you need to quantize sample_data here
+    // using input_tensor->params.scale and input_tensor->params.zero_point
+    // and ensure test_samples.h provides int8_t data.
+    return;
+  } else {
+    // global_error_reporter.Report("Unsupported input tensor type for test inference.");
+    Serial.println("ERROR: Unsupported input tensor type.");
+    return;
+  }
+
+  Serial.print("tensor[0]  ");  Serial.println(input_tensor->data.f[0], 6);
+  Serial.print("tensor[17] ");  Serial.println(input_tensor->data.f[17], 6);
+  Serial.print("dims->size = "); Serial.println(input_tensor->dims->size);
+  Serial.print("dims        = [");
+  for (int i = 0; i < input_tensor->dims->size; ++i) {
+    Serial.print(input_tensor->dims->data[i]); Serial.print(i+1 == input_tensor->dims->size ? "]\n" : "][");
+}
+  // 2. Perform inference
+  unsigned long startTime = micros();
+  TfLiteStatus invoke_status = interp->Invoke();
+  unsigned long duration = micros() - startTime;
+
+  if (invoke_status != kTfLiteOk) {
+    // ("Invoke failed on %s with status %d", sample_name, static_cast<int>(invoke_status));
+    Serial.print("ERROR: Invoke failed for ");
+    Serial.print(sample_name);
+    Serial.print(" Status: ");
+    Serial.println(static_cast<int>(invoke_status));
+    return;
+  }
+
+  Serial.print("Inference for ");
+  Serial.print(sample_name);
+  Serial.print(" took ");
+  Serial.print(duration);
+  Serial.println(" microseconds.");
+
+  // 3. Get output tensor and process results
+  // Assuming float32 output. If int8, dequantization is needed.
+  if (output_tensor->type == kTfLiteFloat32) {
+    Serial.print("Output logits for ");
+    Serial.print(sample_name);
+    Serial.print(": [");
+    // Assuming output_tensor->dims->data[0] is batch (should be 1)
+    // and output_tensor->dims->data[1] is N_CLASSES
+    int num_classes_output = output_tensor->dims->data[output_tensor->dims->size -1]; // Last dimension is num_classes
+    if (num_classes_output != N_CLASSES) {
+        Serial.print(" WARN: Output tensor classes (");
+        Serial.print(num_classes_output);
+        Serial.print(") != N_CLASSES (");
+        Serial.print(N_CLASSES);
+        Serial.print("). Check model. ");
+    }
+
+    for (int i = 0; i < num_classes_output; ++i) {
+      Serial.print(output_tensor->data.f[i], 6); // Print float output
+      if (i < num_classes_output - 1) {
+        Serial.print(", ");
+      }
+    }
+    Serial.println("]");
+
+    // Find predicted class
+    int predicted_class = -1;
+    float max_val = -1000000.0f; // Initialize with a very small number
+    for (int i = 0; i < num_classes_output; ++i) {
+      if (output_tensor->data.f[i] > max_val) {
+        max_val = output_tensor->data.f[i];
+        predicted_class = i;
+      }
+    }
+    Serial.print("Predicted class for ");
+    Serial.print(sample_name);
+    Serial.print(": ");
+    Serial.print(predicted_class);
+    if (predicted_class == expected_label) {
+      Serial.println(" (Correct!)");
+    } else {
+      Serial.print(" (Incorrect, expected: ");
+      Serial.print(expected_label);
+      Serial.println(")");
+    }
+
+  } else if (output_tensor->type == kTfLiteInt8) {
+    // global_error_reporter.Report("Output tensor is int8. Test sample processing needs dequantization.");
+    Serial.println("INFO: Output tensor is int8. Implement dequantization to see float values.");
+    // TODO: If your model output is int8, you need to dequantize output_tensor->data.int8 here
+    // using output_tensor->params.scale and output_tensor->params.zero_point.
+    // Then find the predicted class from the dequantized float values.
+  } else {
+    // global_error_reporter.Report("Unsupported output tensor type for test inference.");
+    Serial.println("ERROR: Unsupported output tensor type.");
+  }
+  Serial.println("------------------------------------");
+}
+void runInference() {
+  Serial.print("I");
+  // --- Start: Print Input Tensor Details ---
+  if (input_tensor != nullptr) {
+    Serial.print("Input Tensor Details:\n"); // Use \n for newline if Serial handles it, otherwise separate println calls
+
+    // Print Tensor Type
+    Serial.print("  Type (as int): ");
+    Serial.println(static_cast<int>(input_tensor->type)); // kTfLiteFloat32 is 1, kTfLiteInt8 is 3, etc.
+
+    // Print Tensor Bytes (total size)
+    Serial.print("  Bytes: ");
+    Serial.println(input_tensor->bytes);
+
+    // Print Number of Dimensions
+    if (input_tensor->dims != nullptr) {
+      Serial.print("  Num Dimensions: ");
+      Serial.println(input_tensor->dims->size);
+
+      // Print Each Dimension's Size
+      Serial.print("  Dimensions: [");
+      for (int i = 0; i < input_tensor->dims->size; ++i) {
+        Serial.print(input_tensor->dims->data[i]);
+        if (i < input_tensor->dims->size - 1) {
+          Serial.print(", ");
+        }
+      }
+      Serial.println("]");
+    } else {
+      Serial.println("  Dims structure is null.");
+    }
+  } else {
+    Serial.println("Input_tensor is null.");
+  }
+  Serial.println("--- End: Input Tensor Details ---");
+  // --- End: Print Input Tensor Details ---
+  memcpy(input_tensor->data.f,
+         window_buf,
+         sizeof(window_buf));
+
+  // 2) invoke
+  TfLiteStatus status = interp->Invoke();
+  if (status != kTfLiteOk) {
+    LogMyAppMessage("Invoke failed with status: %d\n", static_cast<int>(status));
+    return;
+  }
+
+  // 3) send back your predicted class
+  float* out = output_tensor->data.f;
+  int   best = 0;
+  for (int i = 1; i < N_CLASSES; ++i) {
+    if (out[i] > out[best]) best = i;
+  }
+  char msg[16];
+  int  n = snprintf(msg, sizeof(msg), "C:%d\n", best);
+  Serial.write(msg, n);
+}
+void rpcReceiveTask() {
+  PacketHeader hdr;
+  EmgPayload  payload;
+
+  Serial.println("M7: rpcReceiveTask - start");
 
   while (true) {
-    if(boardMode){
-      
-      if (SerialRPC.available()) {
-        
-        char line = (char)SerialRPC.read();
-        // Debug echo of raw characters:
-        Serial.print(line);
-        // SerialRPC.readBytes((char*)&predicted, sizeof(predicted));
+    // ——— Wait for valid header ———
+    do {
+      if (SerialRPC.readBytes((char*)&hdr.sync, 1) != 1)
+        continue;
+    } while (hdr.sync != 0xAA);
+    SerialRPC.readBytes(((char*)&hdr) + 1, sizeof(hdr) - 1);
 
-        // Serial.print(F("Predicted class: "));
-        // Serial.println(predicted);
-        
-      }
-      continue;
+    if (hdr.type == 0 && hdr.len == sizeof(EmgPayload)) {
+      SerialRPC.readBytes((char*)&payload, sizeof(payload));
     }
-      if (SerialRPC.available()) {
-          char line = (char)SerialRPC.read();
-          // Debug echo of raw characters:
-          Serial.print(line);
-          // On newline, process a complete record
-          if (line == '\n') {
-              // Null-terminate and only accept lines that start with '|'
-              buf[idx] = '\0';
-              if (idx > 0 && buf[0] == '|') {
-                  IMUSample sample;
-                  // Skip the '|' at buf[0]
-                  if (sscanf(buf + 1,
-                             "%ld,%ld,%ld,%ld,%ld,%ld",
-                             &sample.ax, &sample.ay, &sample.az,
-                             &sample.gx, &sample.gy, &sample.gz) == 6) {
-                      // Enqueue into lock-free FIFO
-                      size_t head = imuHead.load();
-                      size_t next = (head + 1) % IMU_BUFFER_SIZE;
-                      imuBuffer[head] = sample;
-                      imuHead.store(next);
-                      // Debug:
-                      // // Serial.println(sample.ax);
-                      // Serial.println(buf + 1); // Print the whole line (excluding '|')
-                      // If buffer full, advance tail (drop oldest)
-                      if (next == imuTail.load()) {
-                          imuTail.store((imuTail.load() + 1) % IMU_BUFFER_SIZE);
-                      }
-                  }
-              }
-              // Reset buffer for next line
-              idx = 0;
-          } else {
-              // Accumulate character (if it fits)
-              if (idx < sizeof(buf) - 1) {
-                  buf[idx++] = line;
-              }
-          }
-      } else {
-          continue;
+
+    // compute index of most recent imu sample
+    uint16_t lastImu = (imu_idx + 512 - 1) & 0x01FF;
+
+    if (startSerial) {
+      // ——— Streaming mode: print each EMG sample + its IMU, separated by ‘|’ ———
+      for (int c = 0; c < 12; ++c) {
+        Serial.print(payload.values[c]);
+        if (c < 11) Serial.print(",");
       }
-  }
-}
-
-void listenM4(CommandParameter &parameters)
-{
-  Serial.println(F("Listening to M4"));
-  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-  if(SerialRPC.available()){
-    Serial.println(F("SerialRPC available"));
-    char line = (char)SerialRPC.read();
-    // Debug echo of raw characters:
-    Serial.print(line);
-  }
-}
-
-//================================================================
-// Print function: prints all channel samples at once.
-//================================================================
-void printAllSamples()
-{
-  // EMG+IMU sampling mode
-  if(!boardMode){
-    // Serial.print("ELEC,");
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++)
-    {
-      serialData = (int)(final_channel_data[i] * 0.195);
-      Serial.print(serialData);
-      if (i < NUM_CHANNELS - 1)
-        Serial.print(",");
-    }
-      // Append IMU data from ring buffer or previous sample
       Serial.print("|");
-      static IMUSample prevSample = {0,0,0,0,0,0};
-      size_t tail = imuTail.load();
-      size_t head = imuHead.load();
+      for (int c = 0; c < 6; ++c) {
+        Serial.print(imu_buf[lastImu][c], 6);
+        if (c < 5) Serial.print(",");
+      }
+      Serial.println();
 
-      IMUSample s;
-      if (tail != head) {
-          // New sample available
-          s = imuBuffer[tail];
-          imuTail.store((tail + 1) % IMU_BUFFER_SIZE);
-          prevSample = s;  // Update fallback sample
-      } else {
-          // Use last-seen sample when buffer empty
-          s = prevSample;
+    } else {
+      static int win_ptr = 0;
+      float feat[18];
+
+      // 1) process raw EMG + latest IMU into a normalized 18-dim feature
+      processSample(payload.values, imu_buf[lastImu], feat);
+
+      // 2) store the feature row
+      for (int i = 0; i < 18; ++i) {
+        window_buf[win_ptr][i] = feat[i];
       }
 
-      // Serialize and print s (six scaled ints)
-      char imuBuf[120];
-      snprintf(imuBuf, sizeof(imuBuf),
-              "%ld,%ld,%ld,%ld,%ld,%ld",
-              s.ax, s.ay, s.az,
-              s.gx, s.gy, s.gz);
-      Serial.print(imuBuf);  // All in one atomic call
-
-      Serial.println();      // Terminate line
-      return;
-
+      // 3) advance pointer & check for a full window
+      if (++win_ptr >= 512) {
+        if(inferenceRun){runInference();};// one 512×18 window ready
+             
+        win_ptr = 0;      // wrap around
+      }
     }
-    // Prediction mode: buffer 512 EMG samples
-
-      EmgPacket pkt;
-      for(int ch=0; ch<12; ch++) 
-        pkt.values[ch] = final_channel_data[ch];
-      SerialRPC.write((uint8_t*)&pkt, sizeof(pkt));
-
-      PacketHeader hdr;
-      hdr.sync = 0xAA;
-      hdr.type = 0;                     // EMG
-      hdr.seq  = seq_counter++;
-      hdr.len  = sizeof(EmgPayload);
-
-      EmgPayload payload;
-      for (int ch = 0; ch < 12; ch++)
-        payload.values[ch] = final_channel_data[ch];
-
-      // write header + payload in one go:
-      SerialRPC.write((uint8_t*)&hdr,     sizeof(hdr));
-      SerialRPC.write((uint8_t*)&payload, sizeof(payload));
-
-}
-
-
-
-//================================================================
-// SPI command functions (unchanged)
-//================================================================
-uint16_t SendReadCommand(uint8_t regnum)
-{
-  uint16_t mask = regnum << 8;
-  mask = 0b1100000000000000 | mask;
-  digitalWrite(chipSelectPin, LOW);
-  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-  uint16_t out = SPI.transfer16(mask);
-  SPI.endTransaction();
-  digitalWrite(chipSelectPin, HIGH);
-  return out;
-}
-
-uint16_t SendConvertCommandH(uint8_t channelnum)
-{
-  uint16_t mask = channelnum << 8;
-  mask = 0b0000000000000001 | mask;
-  digitalWrite(chipSelectPin, LOW);
-  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-  uint16_t out = SPI.transfer16(mask);
-  SPI.endTransaction();
-  digitalWrite(chipSelectPin, HIGH);
-  return out;
-}
-
-uint16_t SendWriteCommand(uint8_t regnum, uint8_t data)
-{
-  uint16_t mask = regnum << 8;
-  mask = 0b1000000000000000 | mask | data;
-  digitalWrite(chipSelectPin, LOW);
-  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-  uint16_t out = SPI.transfer16(mask);
-  SPI.endTransaction();
-  digitalWrite(chipSelectPin, HIGH);
-  return out;
-}
-
-void Calibrate()
-{
-  digitalWrite(chipSelectPin, LOW);
-  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-  SPI.transfer16(0b0101010100000000);
-  SPI.endTransaction();
-  digitalWrite(chipSelectPin, HIGH);
-  for (int i = 0; i < 9; i++)
-  {
-    SendReadCommand(40);
   }
 }
 
-//================================================================
-// Timer callback: posts the sampling task to the event queue.
-//================================================================
-void timerCallback()
-{
-  queue.call(spiSampleTask);
+
+void Disconn(CommandParameter &parameters){
+
+  Serial.println(F("OK"));
+  uint8_t code = 0x00;
+  SerialRPC.write(&code, 1);
+  SerialRPC.flush();
+  startSerial = false;
+
+  // sampleTicker.detach();
+
+  
 }
-
-//================================================================
-// Powering channels: using registers 14 and 15 (unchanged)
-//================================================================
-
-void SetAllAmpPwr()
-{
-  // — Read & flush register 14 twice, then grab its current value
-  SendReadCommand(14);
-  SendReadCommand(14);
-  uint8_t mask14 = SendReadCommand(14);
-
-  // — Read & flush register 15 twice, then grab its current value
-  SendReadCommand(15);
-  SendReadCommand(15);
-  uint8_t mask15 = SendReadCommand(15);
-
-  // — Always power reference electrodes 0 and 15
-  mask14 |= (1 << 0);         // channel 0
-  mask15 |= (1 << (15 - 8));  // channel 15
-
-  // — Now power your active channels (those in CHANNELS[], which already excludes 0 & 15)
-  for (uint8_t i = 0; i < NUM_CHANNELS; i++)
-  {
-    uint8_t ch = CHANNELS[i];
-    if (ch < 8)
-      mask14 |= (1 << ch);
-    else
-      mask15 |= (1 << (ch - 8));
+  
+  
+void BBHIdentity(CommandParameter &parameters){
+  Serial.println(F("BBH_Portenta \r")); 
   }
 
-  // — Write back exactly once per register
-  SendWriteCommand(14, mask14);
-  SendWriteCommand(15, mask15);
-}
-
-
-//================================================================
-// CHIP Timer setup and register initialization (mostly unchanged)
-//================================================================
-void setupCHIP_Timer()
-{
-  SendWriteCommand(0, 0b11011110);
-  SendWriteCommand(1, 0b00100000);
-  SendWriteCommand(2, 0b00101000);
-  SendWriteCommand(3, 0b00000000);
-  SendWriteCommand(4, 0b11011000);
-  SendWriteCommand(5, 0b00000000);
-  SendWriteCommand(6, 0b00000000);
-  SendWriteCommand(7, 0b00000000);
-  SendWriteCommand(8, 30);
-  SendWriteCommand(9, 5);
-  SendWriteCommand(10, 43);
-  SendWriteCommand(11, 6);
-
-
-  // RL = 0 → internal bias-drive off (we’re using an external reference electrode)
-  // RLDAC1 = 0 → no DAC output on Jack 1
-  uint8_t RL       = 0;
-  uint8_t RLDAC1   = 0;
-
-  // ADCaux3en = 0 → don’t enable the aux ADC onboard
-  // RLDAC3   = 0 → no DAC output on Jack 3
-  // RLDAC2   = 0 → no DAC output on Jack 2
-  uint8_t ADCaux3en = 0,
-          RLDAC3    = 0,
-          RLDAC2    = 0;
-
-  // build the two bytes exactly as the datasheet wants:
-  uint8_t R12 = (RL << 7) | (RLDAC1 & 0x7F);
-  uint8_t R13 = (ADCaux3en << 7) | (RLDAC3 << 6) | (RLDAC2 << 5);
-
-  // write them out to the Intan
-  SendWriteCommand(12, R12);
-  SendWriteCommand(13, R13);
-  SendWriteCommand(14, 0b00000000);
-  SendWriteCommand(15, 0b00000000);
-
-  SetAllAmpPwr();
-
-  Calibrate();
-
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
-  {
-    SendConvertCommandH(CHANNELS[ch]);
+  int angleToPulseinv(int ang){
+    int pulse = map(ang, 190, 80, SERVOMIN, SERVOMAX);
+    return pulse;
   }
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
-  {
-    SendConvertCommand(CHANNELS[ch]);
+  int angleToPulseCMC(int ang){
+    int pulse = map(ang, 70, 50, 250, 500);
+    return pulse;
   }
-
-  Wire.begin();
-  Wire.beginTransmission(56);
-  Wire.write(0b11110000);
-  Wire.write(0b00001100);
-  Wire.endTransmission();
-}
-
-//================================================================
-// SPI Test (unchanged)
-//================================================================
-void testSPIConnection()
-{
-  Serial.println("Starting SPI connection test...");
-  SPI.begin();
-  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-  delay(250);
-  digitalWrite(chipSelectPin, LOW);
-  uint8_t testByte = 0xAA;
-  uint8_t response = SPI.transfer(testByte);
-  digitalWrite(chipSelectPin, HIGH);
-  Serial.print("SPI Test: Sent 0x");
-  Serial.print(testByte, HEX);
-  Serial.print(", Received 0x");
-  Serial.println(response, HEX);
-}
-
-//================================================================
-// I2C Scanner: scan both Wire and Wire1 buses
-//================================================================
-void scanI2C() {
+  
+  int angleToPulse(int ang){
+    int pulse = map(ang, 80, 190, SERVOMIN, SERVOMAX);
+    return pulse;
+  }
+ 
+void I2CInit(){
   byte error, address;
-
-  // ————— Scan primary I2C bus (Wire) —————
-  int count0 = 0;
-  Serial.println("Scanning primary I2C bus (Wire) for devices...");
-  for (address = 1; address < 127; address++) {
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print("Wire device found at 0x");
-      if (address < 16) Serial.print("0");
-      Serial.println(address, HEX);
-      count0++;
-    } else if (error == 4) {
-      Serial.print("Wire unknown error at 0x");
-      if (address < 16) Serial.print("0");
-      Serial.println(address, HEX);
-    }
-  }
-  if (count0 == 0) Serial.println("No devices found on Wire.");
-
-  // ————— Scan secondary I2C bus (Wire1) —————
+    // ————— Scan secondary I2C bus (Wire1) —————
   int count1 = 0;
   Serial.println("Scanning secondary I2C bus (Wire1) for devices...");
   for (address = 1; address < 127; address++) {
@@ -591,49 +527,7 @@ void scanI2C() {
     Serial.println("No Adafruit PWM Servo Driver found on Wire2.");
 
   }
-
-  Serial.println("I2C scan complete.");
-
-}
-
-void conn(CommandParameter &Parameters)
-{
-  Serial.println("Connected");
-  startSerial = true;
-  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-  sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
-  Serial.println("Ticker attached, sampling started.");
-
-}
-
-void Disconn(CommandParameter &parameters){
-
-  Serial.println(F("OK"));
-
-  sampleTicker.detach();
-
-  
-}
-  
-  
-void BBHIdentity(CommandParameter &parameters){
-  Serial.println(F("BBH_Portenta \r")); 
-  }
-
-  int angleToPulseinv(int ang){
-    int pulse = map(ang, 190, 80, SERVOMIN, SERVOMAX);
-    return pulse;
-  }
-  int angleToPulseCMC(int ang){
-    int pulse = map(ang, 70, 50, 250, 500);
-    return pulse;
-  }
-  
-  int angleToPulse(int ang){
-    int pulse = map(ang, 80, 190, SERVOMIN, SERVOMAX);
-    return pulse;
-  }
-  
+}  
 
 void UpdateDeg(CommandParameter &parameters){
   if(!servo_board){
@@ -684,112 +578,149 @@ void connConfirm(CommandParameter &parameters)
   Serial.println("Ready to receive data");
 }
 
-void modeSwitch(CommandParameter &parameters)
+
+void conn(CommandParameter &parameters)
 {
-  if (boardMode)
-  {
-    boardMode = false;
-    Serial.println(F("EMG+IMU sampling mode"));
-    uint8_t code = 0x00;
-    SerialRPC.write(&code, 1);
-    
-  }
-  else
-  {
-    boardMode = true;
+  Serial.println(F("OK"));
+  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
+  startSerial = true;
+  uint8_t code = 0x01;
+  SerialRPC.write(&code, 1);
+  Serial.println("Ready to receive data");
+}
+
+void inferenceSwitch(CommandParameter &parameters)
+{
+  if (inferenceRun) {
+    inferenceRun = false;
+    Serial.println(F("Inference stopped"));
+  } else {
+    inferenceRun = true;
     uint8_t code = 0x01;
-    Serial.println(F("Prediction mode"));
     SerialRPC.write(&code, 1);
-    sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
+    Serial.println(F("Inference started"));
   }
 }
 
-//================================================================
-// Setup: initialize SPI, I2C, timers, etc.
-//================================================================
-void setup()
-{
+void setup() {
+   // Wait for Serial to be ready
   Serial.begin(250000);
-  while (!Serial)
-  {
-  } // Wait for Serial to initialize
-  Serial.println("Starting simplified connection test...");
-  testSPIConnection();
-  Wire.begin();
-  Wire1.begin();
-  Wire2.begin(); // SDA2/SCL2 for PWM driver
-  delay(100);
-    // secondary I2C for IMU on SDA1/SCL1
-    if (! imu.begin_I2C(0x6A, &Wire1)) {
-      Serial.println("Failed to find LSM6DS3TR-C on Wire1!");
-      IMU_board = false;
-    }else {
-      Serial.println("Found LSM6DS3TR-C on Wire1!");
-      IMU_board = true;
-    }
-    
-  scanI2C();
-  setupCHIP_Timer();
-  pinMode(D5, OUTPUT);
-  digitalWrite(D5, HIGH);
-  bootM4();  
+  while (!Serial){}        
+  bootM4();
 
-  if (!SerialRPC.begin(460800)) {
+
+  if (!SerialRPC.begin(250000)) {
     Serial.println("Failed to initialize SerialRPC!");
     // handle error…
   }else {
     Serial.println("SerialRPC initialized successfully!");
   }
 
-  // Create a thread for the event queue
-  // static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
-  eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
-  // Start background thread to fetch IMU data from M4
-  // static rtos::Thread imuThread(osPriorityNormal, 4*1024);
-  if (IMU_board) {
-    imuThread.start(mbed::callback(imuReceiveTask));
+  while (true) {
+    uint8_t byte = 0;
+    // Wait until the byte 0xAC is received
+
+      if (SerialRPC.available() > 0) {
+        byte = SerialRPC.read();
+        if (byte == 0xAC) {
+          Serial.println("Received byte 0xAC, starting M7 I2C init...");
+          break; // Exit the loop when the byte is received
+        }
+        char line = (char)byte;
+
+        // char line = (char)SerialRPC.read();
+        Serial.print(line);
+      }
+      // rtos::ThisThread::sleep_for(1ms);
+    
   }
-  pwm.begin();
-  pwm.setPWMFreq(60); // Analog servos run at ~60 Hz updates
-  pwm.setOscillatorFrequency(27000000);
-  pwm.setPWM(0, 0, SERVOMIN);
-          
-  // RPC.begin();
+  Serial.println("M7 I2C init started");
+  Wire1.begin();
+  Wire2.begin(); // SDA2/SCL2 for PWM driver
+  delay(100);
+
+    // Explicit address 0x6A for LSM6DS3TRC
+    // secondary I2C for IMU on SDA1/SCL1
+  if (! imu.begin_I2C(0x6A, &Wire1)) {
+      Serial.println("Failed to find LSM6DS3TR-C on Wire1!");
+      IMU_board = false;
+  }else {
+      Serial.println("Found LSM6DS3TR-C on Wire1!");
+      IMU_board = true;
+  }
+  I2CInit();
+
+    // // Core math
+    resolver.AddAdd();
+    resolver.AddMul();
+    resolver.AddSub();
+    resolver.AddMean();          // or .AddReduceMean() if int8
+    resolver.AddRsqrt();
+    resolver.AddFullyConnected();
+    resolver.AddSoftmax();
+    resolver.AddReshape();
+    resolver.AddTranspose();
+    resolver.AddSplit();
+    resolver.AddPack();
+    resolver.AddStridedSlice();
+    resolver.AddConcatenation(); 
+    resolver.AddTanh();
+
+    resolver.AddSum();
+
+    
+    initInterpreter();
+
+      Serial.println("\n--- Running Inferences on Test Samples ---");
+  if (initInterp) { // Check if interpreter is ready
+    for (int i = 0; i < NUM_TEST_SAMPLES; ++i) {
+      char sample_name_buffer[30]; // Increased buffer size
+      sprintf(sample_name_buffer, "Sample %d", i); 
+      run_test_inference((const float (*)[TEST_SAMPLE_N_CHANNELS])all_test_samples[i], sample_name_buffer, test_sample_labels[i]);
+    }
+  } else {
+    Serial.println("ERROR: Interpreter not initialized, cannot run test samples.");
+  }
+  Serial.println("--- Finished Test Sample Inferences ---\n");
+
   SerialCommandHandler.AddCommand(F("connect"), conn);
   SerialCommandHandler.AddCommand(F("connected"), connConfirm);
   SerialCommandHandler.AddCommand(F("DC"), Disconn);
   SerialCommandHandler.AddCommand(F("UD"), UpdateDeg);
   SerialCommandHandler.AddCommand(F("identity"), BBHIdentity);
-  SerialCommandHandler.AddCommand(F("mode"), modeSwitch);
-  SerialCommandHandler.AddCommand(F("listen"), listenM4);
+  SerialCommandHandler.AddCommand(F("inference"), inferenceSwitch);
+
+  // 1) start the RPC task so its stack is carved out first
+  rpcThread.start(mbed::callback(rpcReceiveTask));
+
+    // if (IMU_board) {
+    //   imuThread.start(mbed::callback(imuReceiveTask));
+    // }
+  pwm.begin();
+  pwm.setPWMFreq(60); // Analog servos run at ~60 Hz updates
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWM(0, 0, SERVOMIN);
+
 }
 
 
-//================================================================
-// Main loop: now empty – printing is handled by the event queue.
-//================================================================
-void loop()
-{
-  // if (!startSerial)
-  // {
+
+void loop() {
+
   SerialCommandHandler.Process();
-  // }
+
+  
+  if(IMU_board){
+      sensors_event_t accel, gyro, temp;
+      imu.getEvent(&accel, &gyro, &temp);
+      imu_buf[imu_idx][0] = accel.acceleration.x;
+      imu_buf[imu_idx][1] = accel.acceleration.y;
+      imu_buf[imu_idx][2] = accel.acceleration.z;
+      imu_buf[imu_idx][3] = gyro.gyro.x;
+      imu_buf[imu_idx][4] = gyro.gyro.y;
+      imu_buf[imu_idx][5] = gyro.gyro.z;
+      imu_idx = (imu_idx + 1) % 512;
+      rtos::ThisThread::sleep_for(2ms);
 }
-
-//================================================================
-// SendConvertCommand: unchanged (basic conversion command)
-//================================================================
-uint16_t SendConvertCommand(uint8_t channelnum)
-{
-  uint16_t mask = channelnum << 8;
-  digitalWrite(chipSelectPin, LOW);
-  SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
-  uint16_t out = SPI.transfer16(mask);
-  SPI.endTransaction();
-  digitalWrite(chipSelectPin, HIGH);
-  return out;
 }
-
-
 #endif // CORE_CM7
-
