@@ -22,9 +22,8 @@ CommandHandler<10, 90, 15> SerialCommandHandler;
 bool startSerial = false;
 bool initInterp = false; // true if interpreter is initialized
 // Include the TensorFlow Lite model file.
-#include "modelnocls.h"
+#include "modelv2nocls.h"
 #include "test_samples.h"
-// #define Serial SerialRPC 
 
 extern TwoWire Wire1;
 Adafruit_LSM6DS3TRC imu;
@@ -38,7 +37,7 @@ static tflite::MicroMutableOpResolver<kOpResolverMaxOps> resolver;
 constexpr size_t kTensorArenaSize = 150 * 1024;
 uint8_t tensor_arena[kTensorArenaSize]
     __attribute__((section(".bss.$RAM_D2"), aligned(16)));
-static const tflite::Model* model = tflite::GetModel(model2D_noclsflat_tflite);
+static const tflite::Model* model = tflite::GetModel(model2Dv2_noclsflat_tflite);
 static tflite::MicroInterpreter* interp;
 static TfLiteTensor* input_tensor;
 static TfLiteTensor* output_tensor;
@@ -80,10 +79,8 @@ void rpcReceiveTask();
 
 extern "C" void DebugLog(const char* s) {
   if (Serial) { // Check if Serial has been initialized
-    // Serial.print("TFLM_LOG: "); // Add a prefix to distinguish TFLM logs
+    // Serial.print("TFLM_LOG: ");
     Serial.print(s);
-    // TF_LITE_REPORT_ERROR usually includes a newline in its format string.
-    // If not, add Serial.println() or Serial.print("\n") here.
   }
 }
 constexpr int   MA_WINDOW = 15;
@@ -96,6 +93,7 @@ constexpr float norm_mean[18] = {
 constexpr float norm_std[18] = {0.9995055f,  1.0012661f,  1.0012894f,  0.9988487f,  0.99982405f, 0.99965686f,
  0.9998318f,  0.99919933f, 1.0000762f,  0.9996321f,  0.9992363f,  1.000127f,
  0.99999887f, 1.0000004f,  0.99999005f, 1.0000004f,  1.0000037f,  1.0000271f};
+
 //––– per‐channel TKE‐MA state:
 float win3[12][3] = {0};              // rolling 3‐point buffer
 float tke_sum[12] = {0};              // running sum over MA_WINDOW
@@ -103,6 +101,7 @@ float tke_hist[12][MA_WINDOW] = {0};  // circular history
 int   tke_idx[12] = {0};              // insert ptr per channel
 
 bool inferenceRun = false; // true if inference is running
+
 void processSample(const int16_t raw_emg[12], const float imu[6],
                    float out_feat[18])
 {
@@ -134,7 +133,7 @@ void processSample(const int16_t raw_emg[12], const float imu[6],
   }
 }
 
-void LogMyAppMessage(const char* format, ...) {
+void LogMessage(const char* format, ...) {
   if (!Serial) { // Don't try to log if Serial isn't ready
     return;
   }
@@ -158,30 +157,21 @@ void initInterpreter() {
       model, resolver, tensor_arena, kTensorArenaSize);
   interp = &static_interpreter;
   Serial.println("M7: initInterpreter - interpreter created.");
-  // interp = new tflite::MicroInterpreter(
-  //   model, resolver, tensor_arena, kTensorArenaSize, &error_reporter
-  // );
+
   Serial.println(uintptr_t(tensor_arena) & 0xF);
   size_t arena_ptr_user  = reinterpret_cast<size_t>(tensor_arena);
-  // size_t arena_ptr_interp= reinterpret_cast<size_t>(interp->arena());
 
   Serial.print("Your arena   @ 0x"); Serial.println(arena_ptr_user, HEX);
-  // Serial.print("Interp arena @ 0x"); Serial.println(arena_ptr_interp, HEX);
-    // interp->SetAllocationInfo(true); 
 
   TfLiteStatus alloc_status = interp->AllocateTensors();
   if (alloc_status != kTfLiteOk) {
-    LogMyAppMessage("AllocateTensors() call failed directly with status code: %d. Arena used bytes: %u\n", 
+    LogMessage("AllocateTensors() call failed directly with status code: %d. Arena used bytes: %u\n", 
                     static_cast<int>(alloc_status), 
                     static_cast<unsigned int>(interp->arena_used_bytes()));
-    // Serial.println(interp->arena_used_bytes());
-    
-    // Serial.print("AllocateTensors() failed: ");
-    
     while(1);
   }
   Serial.println(interp->arena_used_bytes());
-    // 6. Get the input tensor pointer
+
   input_tensor = interp->input(0); // Get the first input tensor
 
   if (input_tensor == nullptr) {
@@ -199,10 +189,9 @@ void initInterpreter() {
   initInterp = true; // Interpreter is initialized
 }
 
-// New function to run inference on a single test sample
+// Test run inference on a single test sample
 void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const char* sample_name, int expected_label) {
   if (interp == nullptr || input_tensor == nullptr || output_tensor == nullptr) {
-    // global_error_reporter.Report("Interpreter not initialized for test inference!");
     Serial.println("ERROR: Interpreter not ready for test inference.");
     return;
   }
@@ -225,7 +214,7 @@ void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const
         input_tensor->dims->data[0] != 1 ||
         input_tensor->dims->data[1] != TEST_SAMPLE_WINDOW_SIZE ||
         input_tensor->dims->data[2] != TEST_SAMPLE_N_CHANNELS) {
-      // global_error_reporter.Report("Test sample dimensions mismatch with input tensor!");
+      
       Serial.print("ERROR: Test sample dimensions: [1][");
       Serial.print(TEST_SAMPLE_WINDOW_SIZE);
       Serial.print("][");
@@ -239,25 +228,18 @@ void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const
       Serial.println("]");
       return;
     }
-    
-    // Flatten the 2D sample_data array for memcpy or element-wise copy
-      for (int t = 0; t < TEST_SAMPLE_WINDOW_SIZE; ++t) {
-        for (int c = 0; c < TEST_SAMPLE_N_CHANNELS; ++c) {
-            input_tensor->data.f[t * TEST_SAMPLE_N_CHANNELS + c] = sample_data[t][c];
-        }
-    }  
-    // Or using memcpy if you are sure about layout and sizes:
-    // memcpy(input_tensor->data.f, sample_data, TEST_SAMPLE_WINDOW_SIZE * TEST_SAMPLE_N_CHANNELS * sizeof(float));
+    // Copy data to input tensor
+    memcpy(input_tensor->data.f, sample_data, TEST_SAMPLE_WINDOW_SIZE * TEST_SAMPLE_N_CHANNELS * sizeof(float));
 
   } else if (input_tensor->type == kTfLiteInt8) {
-    // global_error_reporter.Report("Input tensor is int8. Test sample data is float. Quantization needed for test samples.");
+
     Serial.println("ERROR: Input tensor is int8, but test samples are float. Implement quantization for test samples.");
     // TODO: If your model input is int8, you need to quantize sample_data here
     // using input_tensor->params.scale and input_tensor->params.zero_point
     // and ensure test_samples.h provides int8_t data.
     return;
   } else {
-    // global_error_reporter.Report("Unsupported input tensor type for test inference.");
+
     Serial.println("ERROR: Unsupported input tensor type.");
     return;
   }
@@ -275,7 +257,6 @@ void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const
   unsigned long duration = micros() - startTime;
 
   if (invoke_status != kTfLiteOk) {
-    // ("Invoke failed on %s with status %d", sample_name, static_cast<int>(invoke_status));
     Serial.print("ERROR: Invoke failed for ");
     Serial.print(sample_name);
     Serial.print(" Status: ");
@@ -289,7 +270,7 @@ void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const
   Serial.print(duration);
   Serial.println(" microseconds.");
 
-  // 3. Get output tensor and process results
+  // Get output tensor and process results
   // Assuming float32 output. If int8, dequantization is needed.
   if (output_tensor->type == kTfLiteFloat32) {
     Serial.print("Output logits for ");
@@ -390,7 +371,7 @@ void runInference() {
   // 2) invoke
   TfLiteStatus status = interp->Invoke();
   if (status != kTfLiteOk) {
-    LogMyAppMessage("Invoke failed with status: %d\n", static_cast<int>(status));
+    LogMessage("Invoke failed with status: %d\n", static_cast<int>(status));
     return;
   }
 
@@ -460,6 +441,18 @@ void rpcReceiveTask() {
   }
 }
 
+void inferenceSwitch(CommandParameter &parameters)
+{
+  if (inferenceRun) {
+    inferenceRun = false;
+    Serial.println(F("Inference stopped"));
+  } else {
+    inferenceRun = true;
+    uint8_t code = 0x01;
+    SerialRPC.write(&code, 1);
+    Serial.println(F("Inference started"));
+  }
+}
 
 void Disconn(CommandParameter &parameters){
 
@@ -468,12 +461,9 @@ void Disconn(CommandParameter &parameters){
   SerialRPC.write(&code, 1);
   SerialRPC.flush();
   startSerial = false;
-
-  // sampleTicker.detach();
-
+  inferenceRun = false;
   
 }
-  
   
 void BBHIdentity(CommandParameter &parameters){
   Serial.println(F("BBH_Portenta \r")); 
@@ -574,7 +564,6 @@ void UpdateDeg(CommandParameter &parameters){
 void connConfirm(CommandParameter &parameters)
 {
   Serial.println(F("OK"));
-  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
   Serial.println("Ready to receive data");
 }
 
@@ -589,18 +578,6 @@ void conn(CommandParameter &parameters)
   Serial.println("Ready to receive data");
 }
 
-void inferenceSwitch(CommandParameter &parameters)
-{
-  if (inferenceRun) {
-    inferenceRun = false;
-    Serial.println(F("Inference stopped"));
-  } else {
-    inferenceRun = true;
-    uint8_t code = 0x01;
-    SerialRPC.write(&code, 1);
-    Serial.println(F("Inference started"));
-  }
-}
 
 void setup() {
    // Wait for Serial to be ready
@@ -611,7 +588,6 @@ void setup() {
 
   if (!SerialRPC.begin(250000)) {
     Serial.println("Failed to initialize SerialRPC!");
-    // handle error…
   }else {
     Serial.println("SerialRPC initialized successfully!");
   }
@@ -619,7 +595,6 @@ void setup() {
   while (true) {
     uint8_t byte = 0;
     // Wait until the byte 0xAC is received
-
       if (SerialRPC.available() > 0) {
         byte = SerialRPC.read();
         if (byte == 0xAC) {
@@ -627,11 +602,8 @@ void setup() {
           break; // Exit the loop when the byte is received
         }
         char line = (char)byte;
-
-        // char line = (char)SerialRPC.read();
         Serial.print(line);
       }
-      // rtos::ThisThread::sleep_for(1ms);
     
   }
   Serial.println("M7 I2C init started");
@@ -693,9 +665,6 @@ void setup() {
   // 1) start the RPC task so its stack is carved out first
   rpcThread.start(mbed::callback(rpcReceiveTask));
 
-    // if (IMU_board) {
-    //   imuThread.start(mbed::callback(imuReceiveTask));
-    // }
   pwm.begin();
   pwm.setPWMFreq(60); // Analog servos run at ~60 Hz updates
   pwm.setOscillatorFrequency(27000000);
@@ -709,7 +678,6 @@ void loop() {
 
   SerialCommandHandler.Process();
 
-  
   if(IMU_board){
       sensors_event_t accel, gyro, temp;
       imu.getEvent(&accel, &gyro, &temp);

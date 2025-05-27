@@ -30,45 +30,29 @@ mbed::Ticker sampleTicker;
 
 static rtos::Thread eventThread(osPriorityHigh, 16 * 1024);
 
-// IMU instance on secondary I2C bus (Wire1)
-extern TwoWire Wire1;
-Adafruit_LSM6DS3TRC imu;
-bool IMU_board = false;
-
-// BoardMode: true for EMG+IMU data collection, false for prediction Mode
-volatile bool boardMode = false; // Flag for EMG mode
-
-extern TwoWire Wire2; // I2C bus for the PWM driver (Adafruit_PWMServoDriver)
-bool servo_board = false;
 // Forward declarations of SPI commands and helper functions.
 uint16_t SendConvertCommand(uint8_t channelnum);
 uint16_t SendReadCommand(uint8_t regnum);
 uint16_t SendConvertCommandH(uint8_t channelnum);
 uint16_t SendWriteCommand(uint8_t regnum, uint8_t data);
+
 void Calibrate();
 void NotchFilter50(uint8_t ch);
 void printAllSamples();
 
-static float emg_buf[512][12];
-static int   buf_idx = 0;
 bool startSerial = false;
 
 struct PacketHeader {
   uint8_t  sync;     // fixed magic, e.g. 0xAA
   uint8_t  type;     // 0 = EMG, 1 = IMU, 2 = CTRL, …
   uint16_t seq;      // monotonically increasing
-  uint16_t len;      // payload length in bytes (so you can vary it)
+  uint16_t len;      // payload length in bytes
 };
 
 // type-0 payload:
 struct EmgPayload {
   int16_t values[12];
 };
-
-struct EmgPacket { 
-  int16_t values[12]; 
-};
-
 
 static uint16_t seq_counter = 0;
 //================================================================
@@ -187,126 +171,11 @@ void spiSampleTask()
 }
 
 
-//-----------------------------------------------------------------------------
-// Thread to receive ASCII IMU lines from M4 over RPC and push into ring buffer
-//-----------------------------------------------------------------------------  
-// void imuReceiveTask() {
-//   static char buf[80];
-//   size_t idx = 0;
-//   int32_t       predicted = -1;
-
-//   while (true) {
-//     if(boardMode){
-      
-//       if (SerialRPC.available()) {
-        
-//         char line = (char)SerialRPC.read();
-//         // Debug echo of raw characters:
-//         Serial.print(line);
-//         // SerialRPC.readBytes((char*)&predicted, sizeof(predicted));
-
-//         // Serial.print(F("Predicted class: "));
-//         // Serial.println(predicted);
-        
-//       }
-//       continue;
-//     }
-//       if (SerialRPC.available()) {
-//           char line = (char)SerialRPC.read();
-//           // Debug echo of raw characters:
-//           Serial.print(line);
-//           // On newline, process a complete record
-//           if (line == '\n') {
-//               // Null-terminate and only accept lines that start with '|'
-//               buf[idx] = '\0';
-//               if (idx > 0 && buf[0] == '|') {
-//                   IMUSample sample;
-//                   // Skip the '|' at buf[0]
-//                   if (sscanf(buf + 1,
-//                              "%ld,%ld,%ld,%ld,%ld,%ld",
-//                              &sample.ax, &sample.ay, &sample.az,
-//                              &sample.gx, &sample.gy, &sample.gz) == 6) {
-//                       // Enqueue into lock-free FIFO
-//                       size_t head = imuHead.load();
-//                       size_t next = (head + 1) % IMU_BUFFER_SIZE;
-//                       imuBuffer[head] = sample;
-//                       imuHead.store(next);
-//                       // Debug:
-//                       // // Serial.println(sample.ax);
-//                       // Serial.println(buf + 1); // Print the whole line (excluding '|')
-//                       // If buffer full, advance tail (drop oldest)
-//                       if (next == imuTail.load()) {
-//                           imuTail.store((imuTail.load() + 1) % IMU_BUFFER_SIZE);
-//                       }
-//                   }
-//               }
-//               // Reset buffer for next line
-//               idx = 0;
-//           } else {
-//               // Accumulate character (if it fits)
-//               if (idx < sizeof(buf) - 1) {
-//                   buf[idx++] = line;
-//               }
-//           }
-//       } else {
-//           continue;
-//       }
-//   }
-// }
-
-
 //================================================================
 // Print function: prints all channel samples at once.
 //================================================================
 void printAllSamples()
 {
-  // // EMG+IMU sampling mode
-  // if(!boardMode){
-  //   // Serial.print("ELEC,");
-  //   for (uint8_t i = 0; i < NUM_CHANNELS; i++)
-  //   {
-  //     serialData = (int)(final_channel_data[i] * 0.195);
-  //     Serial.print(serialData);
-  //     if (i < NUM_CHANNELS - 1)
-  //       Serial.print(",");
-  //   }
-  //     // Append IMU data from ring buffer or previous sample
-  //     Serial.print("|");
-  //     static IMUSample prevSample = {0,0,0,0,0,0};
-  //     size_t tail = imuTail.load();
-  //     size_t head = imuHead.load();
-
-  //     IMUSample s;
-  //     if (tail != head) {
-  //         // New sample available
-  //         s = imuBuffer[tail];
-  //         imuTail.store((tail + 1) % IMU_BUFFER_SIZE);
-  //         prevSample = s;  // Update fallback sample
-  //     } else {
-  //         // Use last-seen sample when buffer empty
-  //         s = prevSample;
-  //     }
-
-    //   // Serialize and print s (six scaled ints)
-    //   char imuBuf[120];
-    //   snprintf(imuBuf, sizeof(imuBuf),
-    //           "%ld,%ld,%ld,%ld,%ld,%ld",
-    //           s.ax, s.ay, s.az,
-    //           s.gx, s.gy, s.gz);
-    //   Serial.print(imuBuf);  // All in one atomic call
-
-    //   Serial.println();      // Terminate line
-    //   return;
-
-    // }
-    // Prediction mode: buffer 512 EMG samples
-    // SerialRPC.print("ELEC,");
-
-      EmgPacket pkt;
-      for(int ch=0; ch<12; ch++) 
-        pkt.values[ch] = final_channel_data[ch];
-      SerialRPC.write((uint8_t*)&pkt, sizeof(pkt));
-
       PacketHeader hdr;
       hdr.sync = 0xAA;
       hdr.type = 0;                     // EMG
@@ -322,8 +191,6 @@ void printAllSamples()
       SerialRPC.write((uint8_t*)&payload, sizeof(payload));
 
 }
-
-
 
 //================================================================
 // SPI command functions (unchanged)
@@ -386,7 +253,7 @@ void timerCallback()
 }
 
 //================================================================
-// Powering channels: using registers 14 and 15 (unchanged)
+// Powering channels: using registers 14 and 15
 //================================================================
 
 void SetAllAmpPwr()
@@ -405,7 +272,6 @@ void SetAllAmpPwr()
   mask14 |= (1 << 0);         // channel 0
   mask15 |= (1 << (15 - 8));  // channel 15
 
-  // — Now power your active channels (those in CHANNELS[], which already excludes 0 & 15)
   for (uint8_t i = 0; i < NUM_CHANNELS; i++)
   {
     uint8_t ch = CHANNELS[i];
@@ -440,7 +306,7 @@ void setupCHIP_Timer()
   SendWriteCommand(11, 6);
 
 
-  // RL = 0 → internal bias-drive off (we’re using an external reference electrode)
+  // RL = 0 → internal bias-drive off
   // RLDAC1 = 0 → no DAC output on Jack 1
   uint8_t RL       = 0;
   uint8_t RLDAC1   = 0;
@@ -483,7 +349,7 @@ void setupCHIP_Timer()
 }
 
 //================================================================
-// SPI Test (unchanged)
+// SPI Test
 //================================================================
 void testSPIConnection()
 {
@@ -502,7 +368,7 @@ void testSPIConnection()
 }
 
 //================================================================
-// I2C Scanner: scan both Wire and Wire1 buses
+// I2C Scanner: scan Wire for devices (Intan Shield)
 //================================================================
 void scanI2C() {
   byte error, address;
@@ -549,44 +415,19 @@ void conn()
 
 }
 
-
-// void modeSwitch(CommandParameter &parameters)
-// {
-//   if (boardMode)
-//   {
-//     boardMode = false;
-//     Serial.println(F("EMG+IMU sampling mode"));
-//     uint8_t code = 0x00;
-//     SerialRPC.write(&code, 1);
-    
-//   }
-//   else
-//   {
-//     boardMode = true;
-//     uint8_t code = 0x01;
-//     Serial.println(F("Prediction mode"));
-//     SerialRPC.write(&code, 1);
-//     sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
-//   }
-// }
-
 //================================================================
 // Setup: initialize SPI, I2C, timers, etc.
 //================================================================
 void setup()
 {
-  // SerialRPC.begin(250000);
-  // while (!Serial)
-  // {
-
 
   Serial.begin(250000);
   while (!Serial) {}
   if (!SerialRPC.begin()) {
     RPC.println("Failed to initialize SerialRPC!");
   }
-    // } // Wait for Serial to initialize
-  SerialRPC.println("Starting simplified connection test...");
+
+  SerialRPC.println("Starting M4 connection test...");
   delay(100);
   testSPIConnection();
   Wire.begin();
@@ -601,20 +442,10 @@ void setup()
   // Create a thread for the event queue
   static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
   eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
-  // Start background thread to fetch IMU data from M4
-  // static rtos::Thread imuThread(osPriorityNormal, 4*1024);
-  // if (IMU_board) {
-  //   imuThread.start(mbed::callback(imuReceiveTask));
-  // }
-  // pwm.begin();
-  // pwm.setPWMFreq(60); // Analog servos run at ~60 Hz updates
-  // pwm.setOscillatorFrequency(27000000);
-  // pwm.setPWM(0, 0, SERVOMIN);
-          
 }
 
 //================================================================
-// Main loop: now empty – printing is handled by the event queue.
+// Main loop: Expecting a single byte to start the serial connection and sending EMG data
 //================================================================
 void loop()
 {
@@ -629,7 +460,7 @@ void loop()
 }
 
 //================================================================
-// SendConvertCommand: unchanged (basic conversion command)
+// SendConvertCommand: unchanged
 //================================================================
 uint16_t SendConvertCommand(uint8_t channelnum)
 {
