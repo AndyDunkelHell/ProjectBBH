@@ -16,13 +16,19 @@
 #include <atomic>
 #include <Adafruit_PWMServoDriver.h>
 
+// --- GLOBALS FOR QUANTIZATION PARAMETERS ---
+static float input_scale = 0.0f;
+static int8_t input_zero_point = 0;
+static float output_scale = 0.0f;
+static int8_t output_zero_point = 0;
+
 static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40, Wire2);
 CommandHandler<10, 90, 15> SerialCommandHandler;
 
 bool startSerial = false;
 bool initInterp = false; // true if interpreter is initialized
 // Include the TensorFlow Lite model file.
-#include "modelv2nocls.h"
+#include "model_tiny.h"
 #include "test_samples.h"
 
 extern TwoWire Wire1;
@@ -37,7 +43,7 @@ static tflite::MicroMutableOpResolver<kOpResolverMaxOps> resolver;
 constexpr size_t kTensorArenaSize = 150 * 1024;
 uint8_t tensor_arena[kTensorArenaSize]
     __attribute__((section(".bss.$RAM_D2"), aligned(16)));
-static const tflite::Model* model = tflite::GetModel(model2Dv2_noclsflat_tflite);
+static const tflite::Model* model = tflite::GetModel(model2Dtinyv5_tflite);
 static tflite::MicroInterpreter* interp;
 static TfLiteTensor* input_tensor;
 static TfLiteTensor* output_tensor;
@@ -168,25 +174,46 @@ void initInterpreter() {
     LogMessage("AllocateTensors() call failed directly with status code: %d. Arena used bytes: %u\n", 
                     static_cast<int>(alloc_status), 
                     static_cast<unsigned int>(interp->arena_used_bytes()));
+    Serial.println("M4: FATAL ERROR: Failed to allocate tensors in interpreter!");
     while(1);
   }
+  Serial.println("Successfully allocated tensors in interpreter.");
   Serial.println(interp->arena_used_bytes());
 
-  input_tensor = interp->input(0); // Get the first input tensor
-
+  // --- Get Tensors (as before) ---
+  input_tensor = interp->input(0);
   if (input_tensor == nullptr) {
-    Serial.println("M7: initInterpreter - FATAL ERROR: input_tensor is NULL even after AllocateTensors() succeeded!");
+    Serial.println("M4: FATAL ERROR: input_tensor is NULL!");
     while(1); // Halt
   }
-  Serial.println("M7: initInterpreter - input_tensor pointer obtained successfully.");
 
   output_tensor = interp->output(0);
-  
   if (output_tensor == nullptr) {
-    Serial.println("M7: initInterpreter - FATAL ERROR: output_tensor is NULL even after AllocateTensors() succeeded!");
+    Serial.println("M4: FATAL ERROR: output_tensor is NULL!");
     while(1); // Halt
   }
-  initInterp = true; // Interpreter is initialized
+
+  // --- NEW, CORRECTED LOCATION FOR GETTING QUANTIZATION PARAMS ---
+  // This is the best place, right after we know the tensors are valid.
+  if (input_tensor->type == kTfLiteInt8) {
+      input_scale = input_tensor->params.scale;
+      input_zero_point = input_tensor->params.zero_point;
+      LogMessage("Input tensor is INT8. Scale: %f, Zero-Point: %d", input_scale, input_zero_point);
+  } else {
+      LogMessage("Input tensor is FLOAT32.");
+  }
+
+  if (output_tensor->type == kTfLiteInt8) {
+      output_scale = output_tensor->params.scale;
+      output_zero_point = output_tensor->params.zero_point;
+      LogMessage("Output tensor is INT8. Scale: %f, Zero-Point: %d", output_scale, output_zero_point);
+  } else {
+      LogMessage("Output tensor is FLOAT32.");
+  }
+  // --- END OF NEW LOGIC ---
+
+  initInterp = true; // Mark interpreter as fully ready
+
 }
 
 // Test run inference on a single test sample
