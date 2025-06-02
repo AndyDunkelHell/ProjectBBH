@@ -18,12 +18,15 @@ limitations under the License.
 #include <stdint.h>
 
 #include <limits>
-#ifndef ARDUINO
+#ifndef TF_LITE_STATIC_MEMORY
 #include <string>
-#endif  // ARDUINO
+#endif  // TF_LITE_STATIC_MEMORY
 
 #include "tensorflow/lite/core/c/builtin_op_data.h"
 #include "tensorflow/lite/core/c/common.h"
+#ifndef NDEBUG
+#include "tensorflow/lite/kernels/op_macros.h"
+#endif
 
 namespace tflite {
 
@@ -97,7 +100,7 @@ TfLiteStatus GetOutputSafe(const TfLiteContext* context, const TfLiteNode* node,
 const TfLiteTensor* GetOptionalInputTensor(const TfLiteContext* context,
                                            const TfLiteNode* node, int index);
 
-#ifndef ARDUINO
+#ifndef TF_LITE_STATIC_MEMORY
 // Note: You must check if result is not null:
 //
 //   TfLiteTensor* my_tensor = GetTemporary(context, node, kMyTensorIdx);
@@ -145,7 +148,7 @@ const TfLiteTensor* GetIntermediates(TfLiteContext* context,
 TfLiteStatus GetIntermediatesSafe(const TfLiteContext* context,
                                   const TfLiteNode* node, int index,
                                   TfLiteTensor** tensor);
-#endif  // ARDUINO
+#endif  // TF_LITE_STATIC_MEMORY
 
 inline int NumDimensions(const TfLiteTensor* t) { return t->dims->size; }
 inline int SizeOfDimension(const TfLiteTensor* t, int dim) {
@@ -159,30 +162,37 @@ inline int NumOutputs(const TfLiteNode* node) {
   return node->outputs == nullptr ? 0 : node->outputs->size;
 }
 
-#ifndef ARDUINO
+#ifndef TF_LITE_STATIC_MEMORY
 inline int NumIntermediates(const TfLiteNode* node) {
   return node->intermediates->size;
 }
-#endif  // ARDUINO
-
-inline int64_t NumElements(const TfLiteIntArray* dims) {
-  int64_t count = 1;
-  for (int i = 0; i < dims->size; ++i) {
-    count *= dims->data[i];
-  }
-  return count;
-}
-
-inline int64_t NumElements(const TfLiteTensor* t) {
-  return NumElements(t->dims);
-}
+#endif  // TF_LITE_STATIC_MEMORY
 
 inline int64_t NumElements(const int* dims, int num_dims) {
   int64_t count = 1;
   for (int i = 0; i < num_dims; ++i) {
+#ifndef NDEBUG
+    if (count <= 0) {
+      break;
+    }
+    // Check that number of elements can fit in 32 bit int. Most of tflite
+    // assumes the result of `NumElements` is < MAX_INT and static or implicit
+    // casts to `int32_t` without any checks. It is more meaningful to check
+    // that the result fits into 32 bits than for standard overflow on 64 bit
+    // type.
+    TF_LITE_ASSERT(dims[i] < std::numeric_limits<int>::max() / count);
+#endif
     count *= dims[i];
   }
   return count;
+}
+
+inline int64_t NumElements(const TfLiteIntArray* dims) {
+  return NumElements(dims->data, dims->size);
+}
+
+inline int64_t NumElements(const TfLiteTensor* t) {
+  return NumElements(t->dims);
 }
 
 // Determines whether tensor is constant.
@@ -204,22 +214,23 @@ inline bool IsConstantOrPersistentTensor(const TfLiteTensor* tensor) {
 inline bool IsDynamicTensor(const TfLiteTensor* tensor) {
   return tensor->allocation_type == kTfLiteDynamic;
 }
-
+#ifndef TF_LITE_STATIC_MEMORY
 // Sets tensor to dynamic.
 inline void SetTensorToDynamic(TfLiteTensor* tensor) {
   if (tensor->allocation_type != kTfLiteDynamic) {
+    TfLiteTensorDataFree(tensor);
     tensor->allocation_type = kTfLiteDynamic;
-    tensor->data.raw = nullptr;
   }
 }
 
 // Sets tensor to persistent and read-only.
 inline void SetTensorToPersistentRo(TfLiteTensor* tensor) {
   if (tensor->allocation_type != kTfLitePersistentRo) {
+    TfLiteTensorDataFree(tensor);
     tensor->allocation_type = kTfLitePersistentRo;
-    tensor->data.raw = nullptr;
   }
 }
+#endif  // TF_LITE_STATIC_MEMORY
 
 // Determines whether it is a hybrid op - one that has float inputs and
 // quantized weights.
@@ -291,7 +302,7 @@ void CalculateActivationRange(TfLiteFusedActivation activation,
 // Return true if the given tensors have the same shape.
 bool HaveSameShapes(const TfLiteTensor* input1, const TfLiteTensor* input2);
 
-#if !defined(ARDUINO)
+#if !defined(TF_LITE_STATIC_MEMORY)
 // Gets the output shape from the input tensor.
 TfLiteStatus GetOutputShapeFromInput(TfLiteContext* context,
                                      const TfLiteTensor* input,
@@ -299,7 +310,9 @@ TfLiteStatus GetOutputShapeFromInput(TfLiteContext* context,
 
 std::string GetShapeDebugString(const TfLiteIntArray* shape);
 
-#endif  // !defined(ARDUINO)
+std::string GetTensorDebugString(const TfLiteTensor* tensor);
+
+#endif  // !defined(TF_LITE_STATIC_MEMORY)
 
 // Calculates the output_shape that is necessary for element-wise operations
 // with broadcasting involving the two input tensors.

@@ -18,7 +18,7 @@ limitations under the License.
 
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/kernels/internal/types.h"
-// #include "tensorflow/lite/micro/micro_common.h"
+#include "tensorflow/lite/micro/micro_common.h"
 
 namespace tflite {
 
@@ -68,26 +68,26 @@ TfLiteStatus TransposeRowsColumns(const TfLiteEvalTensor& tensor_in,
 
 RuntimeShape SwapRowColumnDims(const RuntimeShape& shape);
 
-TfLiteRegistration Register_BATCH_MATMUL();
+TFLMRegistration Register_BATCH_MATMUL();
 
 #if defined(CMSIS_NN)
 
 // Returns a TFLMRegistration struct for kernel variant that only supports
 // int8 matrix multiplication and uses the latency optimized
 // implementations.
-TfLiteRegistration Register_BATCH_MATMUL_INT8();
+TFLMRegistration Register_BATCH_MATMUL_INT8();
 
 // Returns a TFLMRegistration struct for kernel variant that only supports
 // int16 matrix multiplication and uses the latency optimized
 // implementations.
-TfLiteRegistration Register_BATCH_MATMUL_INT16();
+TFLMRegistration Register_BATCH_MATMUL_INT16();
 
 #else
-inline TfLiteRegistration Register_BATCH_MATMUL_INT8() {
+inline TFLMRegistration Register_BATCH_MATMUL_INT8() {
   return Register_BATCH_MATMUL();
 }
 
-inline TfLiteRegistration Register_BATCH_MATMUL_INT16() {
+inline TFLMRegistration Register_BATCH_MATMUL_INT16() {
   return Register_BATCH_MATMUL();
 }
 #endif  // defined(CMSIS_NN)

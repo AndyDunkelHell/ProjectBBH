@@ -237,7 +237,7 @@ void imuReceiveTask() {
       if (SerialRPC.available()) {
           char line = (char)SerialRPC.read();
           // Debug echo of raw characters:
-          Serial.print(line);
+          // Serial.print(line);
           // On newline, process a complete record
           if (line == '\n') {
               // Null-terminate and only accept lines that start with '|'
@@ -739,6 +739,21 @@ void setup()
     // handle error…
   }else {
     Serial.println("SerialRPC initialized successfully!");
+  }
+
+  while (true) {
+    uint8_t byte = 0;
+    // Wait until the byte 0xAC is received
+      if (SerialRPC.available() > 0) {
+        byte = SerialRPC.read();
+        if (byte == 0xAC) {
+          Serial.println("Received byte 0xAC, starting M7 I2C init...");
+          break; // Exit the loop when the byte is received
+        }
+        char line = (char)byte;
+        Serial.print(line);
+      }
+    
   }
 
   // Create a thread for the event queue
