@@ -14,7 +14,7 @@
             "name": "PIO Debug",
             "executable": "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/.pio/build/portenta_h7_m7/firmware.elf",
             "projectEnvName": "portenta_h7_m7",
-            "toolchainBinDir": "C:/Users/speak/.platformio/packages/toolchain-gccarmnoneeabi/bin",
+            "toolchainBinDir": "C:/Users/speak/.platformio/packages/toolchain-gccarmnoneeabi@1.70201.0/bin",
             "internalConsoleOptions": "openOnSessionStart",
             "preLaunchTask": {
                 "type": "PlatformIO",
@@ -27,7 +27,7 @@
             "name": "PIO Debug (skip Pre-Debug)",
             "executable": "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/.pio/build/portenta_h7_m7/firmware.elf",
             "projectEnvName": "portenta_h7_m7",
-            "toolchainBinDir": "C:/Users/speak/.platformio/packages/toolchain-gccarmnoneeabi/bin",
+            "toolchainBinDir": "C:/Users/speak/.platformio/packages/toolchain-gccarmnoneeabi@1.70201.0/bin",
             "internalConsoleOptions": "openOnSessionStart"
         },
         {
@@ -36,7 +36,7 @@
             "name": "PIO Debug (without uploading)",
             "executable": "C:/Users/speak/Documents/GitHub/ProjectBBH/BBH_Electrodes/.pio/build/portenta_h7_m7/firmware.elf",
             "projectEnvName": "portenta_h7_m7",
-            "toolchainBinDir": "C:/Users/speak/.platformio/packages/toolchain-gccarmnoneeabi/bin",
+            "toolchainBinDir": "C:/Users/speak/.platformio/packages/toolchain-gccarmnoneeabi@1.70201.0/bin",
             "internalConsoleOptions": "openOnSessionStart",
             "loadMode": "manual"
         }

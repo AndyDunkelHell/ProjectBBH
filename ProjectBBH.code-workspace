@@ -6,6 +6,10 @@
 		{
 			"name": "BBH_Electrodes",
 			"path": "BBH_Electrodes"
+		},
+		{
+			"name": "BBH_v2Portentah7M4",
+			"path": "BBH_v2Portentah7M4"
 		}
 	],
 	"settings": {

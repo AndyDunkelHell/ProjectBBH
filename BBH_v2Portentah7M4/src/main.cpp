@@ -29,7 +29,7 @@ static tflite::MicroErrorReporter     error_reporter;
 // constexpr int kOpResolverMaxOps = 18;  
 // static tflite::MicroMutableOpResolver<kOpResolverMaxOps> resolver;
 static tflite::AllOpsResolver        resolver;
-constexpr int kTensorArenaSize = 80 * 1024;
+constexpr int kTensorArenaSize = 120 * 1024;
 // static uint8_t* tensor_arena = nullptr;
 uint8_t tensor_arena[kTensorArenaSize];
 static const tflite::Model* model     = tflite::GetModel(model2Dv3flat_tflite);
