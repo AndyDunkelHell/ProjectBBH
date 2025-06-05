@@ -10,6 +10,10 @@
 		{
 			"name": "BBH_v2Portentah7M4",
 			"path": "BBH_v2Portentah7M4"
+		},
+		{
+			"name": "PortentaTGRT",
+			"path": "../../PlatformIO/Projects/PortentaTGRT"
 		}
 	],
 	"settings": {
