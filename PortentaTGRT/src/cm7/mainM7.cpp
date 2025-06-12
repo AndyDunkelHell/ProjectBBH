@@ -13,10 +13,10 @@
 #include <SerialRPC.h>
 #include <Adafruit_PWMServoDriver.h>
 
-#define NUM_CHANNELS 2
+#define NUM_CHANNELS 4
 
 
-int CHANNELS[12] = {1,2};
+int CHANNELS[4] = {1,2,3,4};
 
 // Alternatively, you could change the order with:
 // int CHANNELS[12] = {11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1};
@@ -91,27 +91,31 @@ struct EmgPayload {
 static uint16_t seq_counter = 0;
 
 using namespace std::chrono_literals;
-
+volatile int i = 0;
+volatile float in[4][3] = {{0}}; //Keep track of past values of the original signal, which helps the notch filter remove 50 Hz or 60 Hz noise
+volatile float out[4][3] = {{0}}; //Keep track of the past values of the processed signal, which helps the notch filter remove 50 Hz or 60 Hz noise 
 
 //================================================================
 // Notch filter (unchanged)
 //================================================================
-void NotchFilter50(uint8_t ch)
-{
-  // Shift previous inputs
-  inBuffer[ch][0] = inBuffer[ch][1];
-  inBuffer[ch][1] = inBuffer[ch][2];
-  inBuffer[ch][2] = channel_data[ch];
+void NotchFilter50() {
+    //Function that uses an IIR notch filter to remove 50 Hz noise, and scale the data to be easily read by an 8-bit DAC
+    
+    //Updating the previous values for the input arrays as a new sample comes in
+    in[i][0] = in[i][1];
+    in[i][1] = in[i][2];
+    in[i][2] = channel_data[i];
 
-  // Apply the IIR notch filter equation
-  outBuffer[ch][2] = 0.9696f * inBuffer[ch][0] - 1.8443f * inBuffer[ch][1] + 0.9696f * inBuffer[ch][2] - 0.9391f * outBuffer[ch][0] + 1.8442f * outBuffer[ch][1];
+    //Performing the IIR notch filter algorithm
+    //out[i][2] = a*b2*in[i][0] + a*b1*in[i][1] + a*b0*in[i][2] - a2*out[i][0] - a1*out[i][1];
+    out[i][2] = 0.9696 * in[i][0] - 1.8443 * in[i][1] + 0.9696 * in[i][2] - 0.9391 * out[i][0] + 1.8442 * out[i][1];
 
-  // Shift previous outputs
-  outBuffer[ch][0] = outBuffer[ch][1];
-  outBuffer[ch][1] = outBuffer[ch][2];
+    //Update the previous values for the output arrays
+    out[i][0] = out[i][1];
+    out[i][1] = out[i][2];
 
-  // Store the filtered result
-  final_channel_data[ch] = outBuffer[ch][2];
+	//Save the output of the IIR notch filter algorithm to the global variable channel_data
+    channel_data[i] = out[i][2];
 }
 
 void noNotchFilter(uint8_t ch)
@@ -130,31 +134,26 @@ static uint8_t commandChannelIndex = 0;
 // Counter for how many valid results we have received in this cycle.
 static uint8_t resultsReceivedCount = 0;
 
-volatile int i = 0; 
+
 void spiSampleTask(){
 
-  	//Read the channel data from whichever sample in the pipeline corresponds to this 1/2000th of a second
-  if (i == 0) {
-		channel_data[0] = SendConvertCommand(CHANNELS[i]);
-	}
 
-	if (i == 1) {
-		channel_data[1] = SendConvertCommand(CHANNELS[i]);
 
-	}
+	channel_data[i] = SendConvertCommand(CHANNELS[i]);
 
+	
+  NotchFilter50();
   final_channel_data[i] = channel_data[i];
 
-  if (i == 1)
+  	if (i == NUM_CHANNELS-1)
 {		//If we just read the data from the SECONDCHANNEL, read FIRSTCHANNEL on the next iteration
 		i = 0;
     queue.call(printAllSamples);}
 	else
-{		//If we just read the data from the FIRSTCHANNEL, read SECONDCHANNEL on the next iteration
-		i++;}
-
+		//If we just read the data from the FIRSTCHANNEL, read SECONDCHANNEL on the next iteration
+		i++;
+      
 }
-
 
 //-----------------------------------------------------------------------------
 // Thread to receive ASCII IMU lines from M4 over RPC and push into ring buffer
@@ -354,33 +353,50 @@ void timerCallback()
 
 void SetAllAmpPwr()
 {
-  // — Read & flush register 14 twice, then grab its current value
-  SendReadCommand(14);
-  SendReadCommand(14);
-  uint8_t mask14 = SendReadCommand(14);
+    uint8_t previousreg14;
+	  uint8_t previousreg15;
+	
+    SendReadCommand(14);
+    SendReadCommand(14);
+    previousreg14 = SendReadCommand(14);
+    SendReadCommand(15);
+    SendReadCommand(15);
+    previousreg15 = SendReadCommand(15);
+    
+    // For channels 0-7, set the corresponding bit in register 14.
+    for (uint8_t ch = 0; ch < 8; ch++) {
+      SendWriteCommand(14, (1<<ch | previousreg14));
+      previousreg14 |= (1 << ch);
+    }
+    // For channels 8-11 (since NUM_CHANNELS==12), set the appropriate bits in register 15.
+    for (uint8_t ch = 8; ch < NUM_CHANNELS; ch++) {
+      SendWriteCommand(15, (1<<abs(ch-8) | previousreg15));
+      previousreg15 |= (1 << (ch - 8));
+    }
+    // For channels 0-7, set the corresponding bit in register 14.ä
+    int final_channel = CHANNELS[NUM_CHANNELS-1];
+  
+    for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+      if (CHANNELS[ch]  == final_channel) {
+        if (CHANNELS[ch] < 8) {
+          SendWriteCommand(14, (1<<CHANNELS[ch] | previousreg14));
 
-  // — Read & flush register 15 twice, then grab its current value
-  SendReadCommand(15);
-  SendReadCommand(15);
-  uint8_t mask15 = SendReadCommand(15);
+        }else if (CHANNELS[ch] >= 8){
+          SendWriteCommand(15, (1<<abs(CHANNELS[ch]-8) | previousreg15)); //abs() is not necessary, as the conditional "else if()" ensures FIRSTCHANNEL-8 is positive. However, the compiler gives a warning unless the FIRSTCHANNEL-8 is positive. Hence abs()
 
-  // — Always power reference electrodes 0 and 15
-  mask14 |= (1 << 0);         // channel 0
-  mask15 |= (1 << (15 - 8));  // channel 15
+        }
+        }else{
+      if (CHANNELS[ch] < 8) {
+        SendWriteCommand(14, (1<<CHANNELS[ch] | previousreg14));
+        previousreg14 = 1 << CHANNELS[ch] | previousreg14;
+      }else if (CHANNELS[ch] >= 8){
+        SendWriteCommand(15, (1<<abs(CHANNELS[ch]-8) | previousreg15)); //abs() is not necessary, as the conditional "else if()" ensures FIRSTCHANNEL-8 is positive. However, the compiler gives a warning unless the FIRSTCHANNEL-8 is positive. Hence abs()
+        previousreg15 = 1 << abs(CHANNELS[ch]-8) | previousreg15;
+      }
+      }
+    
 
-  // — Now power your active channels (those in CHANNELS[], which already excludes 0 & 15)
-  for (uint8_t i = 0; i < NUM_CHANNELS; i++)
-  {
-    uint8_t ch = CHANNELS[i];
-    if (ch < 8)
-      mask14 |= (1 << ch);
-    else
-      mask15 |= (1 << (ch - 8));
-  }
-
-  // — Write back exactly once per register
-  SendWriteCommand(14, mask14);
-  SendWriteCommand(15, mask15);
+    }
 }
 
 
@@ -406,14 +422,14 @@ void setupCHIP_Timer()
   // RL = 0 → internal bias-drive off (we’re using an external reference electrode)
   // RLDAC1 = 0 → no DAC output on Jack 1
   uint8_t RL       = 0;
-  uint8_t RLDAC1   = 0;
+  uint8_t RLDAC1   = 5;
 
   // ADCaux3en = 0 → don’t enable the aux ADC onboard
   // RLDAC3   = 0 → no DAC output on Jack 3
   // RLDAC2   = 0 → no DAC output on Jack 2
   uint8_t ADCaux3en = 0,
           RLDAC3    = 0,
-          RLDAC2    = 0;
+          RLDAC2    = 1;
 
   // build the two bytes exactly as the datasheet wants:
   uint8_t R12 = (RL << 7) | (RLDAC1 & 0x7F);
@@ -429,20 +445,20 @@ void setupCHIP_Timer()
 
   Calibrate();
 
-  // for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
-  // {
-  //   SendConvertCommandH(CHANNELS[ch]);
-  // }
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
+  {
+    SendConvertCommandH(CHANNELS[ch]);
+  }
   for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
   {
     SendConvertCommand(CHANNELS[ch]);
   }
 
-  Wire.begin();
-  Wire.beginTransmission(56);
-  Wire.write(0b11110000);
-  Wire.write(0b00001100);
-  Wire.endTransmission();
+  // Wire.begin();
+  // Wire.beginTransmission(56);
+  // Wire.write(0b11110000);
+  // Wire.write(0b00001100);
+  // Wire.endTransmission();
 }
 
 //================================================================
@@ -451,6 +467,7 @@ void setupCHIP_Timer()
 void testSPIConnection()
 {
   Serial.println("Starting SPI connection test...");
+  digitalWrite(chipSelectPin, HIGH);
   SPI.begin();
   SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE0));
   delay(250);
@@ -530,10 +547,10 @@ void conn(CommandParameter &Parameters)
 {
   // Serial.println("Connected");
   startSerial = true;
-  SendConvertCommand(CHANNELS[0]);
-  SendConvertCommand(CHANNELS[1]);
+  // SendConvertCommand(CHANNELS[0]);
+  // SendConvertCommand(CHANNELS[1]);
   // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-  sampleTicker.attach(timerCallback, std::chrono::microseconds(1000));
+  sampleTicker.attach(timerCallback, std::chrono::microseconds(250));
   // Serial.println("Ticker attached, sampling started.");
 
 }
@@ -643,8 +660,8 @@ void setup()
 {
   // Serial.begin(1000000);
   pinMode(LED_BUILTIN, OUTPUT);
-  SerialUSB.begin(1000000);
-  while (!SerialUSB)
+  Serial.begin(250000);
+  while (!Serial)
   {} // Wait for Serial to initialize
   Serial.println("Starting simplified connection test...");
   testSPIConnection();
@@ -663,32 +680,32 @@ void setup()
     
   scanI2C();
   setupCHIP_Timer();
-  pinMode(D5, OUTPUT);
-  digitalWrite(D5, HIGH);
-  bootM4();  
+  pinMode(D6, OUTPUT);
+  digitalWrite(D6, HIGH);
+  // bootM4();  
 
-  if (!SerialRPC.begin(460800)) {
-    Serial.println("Failed to initialize SerialRPC!");
-    // handle error…
-  }else {
-    Serial.println("SerialRPC initialized successfully!");
-  }
+  // if (!SerialRPC.begin(460800)) {
+  //   Serial.println("Failed to initialize SerialRPC!");
+  //   // handle error…
+  // }else {
+  //   Serial.println("SerialRPC initialized successfully!");
+  // }
 
-  while (true) {
-    uint8_t byte = 0;
-    // Wait until the byte 0xAC is received
-      if (SerialRPC.available() > 0) {
-        byte = SerialRPC.read();
-        if (byte == 0xAC) {
-          Serial.println("Received byte 0xAC, starting M7 I2C init...");
-          Serial.flush();
-          break; // Exit the loop when the byte is received
-        }
-        char line = (char)byte;
-        Serial.print(line);
-      }
+  // while (true) {
+  //   uint8_t byte = 0;
+  //   // Wait until the byte 0xAC is received
+  //     if (SerialRPC.available() > 0) {
+  //       byte = SerialRPC.read();
+  //       if (byte == 0xAC) {
+  //         Serial.println("Received byte 0xAC, starting M7 I2C init...");
+  //         Serial.flush();
+  //         break; // Exit the loop when the byte is received
+  //       }
+  //       char line = (char)byte;
+  //       Serial.print(line);
+  //     }
     
-  }
+  // }
 
   // Create a thread for the event queue
   // static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
@@ -724,6 +741,16 @@ void loop()
   SerialCommandHandler.Process();
   // }
 
+
+    // for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+      
+    //    serialData = (int)(final_channel_data[ch]*0.195);
+    //     Serial.print(serialData);
+    //     if (ch < NUM_CHANNELS - 1)
+    //         Serial.print(", ");
+    // }
+    //   // add delay as needed.
+    // Serial.println("|550,-550,0,0,0,0");
 }
 
 //================================================================
