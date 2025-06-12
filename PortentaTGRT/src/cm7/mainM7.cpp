@@ -13,10 +13,10 @@
 #include <SerialRPC.h>
 #include <Adafruit_PWMServoDriver.h>
 
-#define NUM_CHANNELS 4
+#define NUM_CHANNELS 12
 
 
-int CHANNELS[4] = {1,2,3,4};
+int CHANNELS[12] = {1,2,3,4,5,6,7,8,11,12,13,14};
 
 // Alternatively, you could change the order with:
 // int CHANNELS[12] = {11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1};
@@ -92,8 +92,8 @@ static uint16_t seq_counter = 0;
 
 using namespace std::chrono_literals;
 volatile int i = 0;
-volatile float in[4][3] = {{0}}; //Keep track of past values of the original signal, which helps the notch filter remove 50 Hz or 60 Hz noise
-volatile float out[4][3] = {{0}}; //Keep track of the past values of the processed signal, which helps the notch filter remove 50 Hz or 60 Hz noise 
+volatile float in[NUM_CHANNELS][3] = {{0}}; //Keep track of past values of the original signal, which helps the notch filter remove 50 Hz or 60 Hz noise
+volatile float out[NUM_CHANNELS][3] = {{0}}; //Keep track of the past values of the processed signal, which helps the notch filter remove 50 Hz or 60 Hz noise 
 
 //================================================================
 // Notch filter (unchanged)
@@ -547,10 +547,10 @@ void conn(CommandParameter &Parameters)
 {
   // Serial.println("Connected");
   startSerial = true;
-  // SendConvertCommand(CHANNELS[0]);
-  // SendConvertCommand(CHANNELS[1]);
+  SendConvertCommand(CHANNELS[0]);
+  SendConvertCommand(CHANNELS[1]);
   // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-  sampleTicker.attach(timerCallback, std::chrono::microseconds(250));
+  sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
   // Serial.println("Ticker attached, sampling started.");
 
 }
@@ -649,7 +649,7 @@ void modeSwitch(CommandParameter &parameters)
     uint8_t code = 0x01;
     Serial.println(F("Prediction mode"));
     SerialRPC.write(&code, 1);
-    sampleTicker.attach(timerCallback, std::chrono::microseconds(125));
+    sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
   }
 }
 
@@ -682,30 +682,30 @@ void setup()
   setupCHIP_Timer();
   pinMode(D6, OUTPUT);
   digitalWrite(D6, HIGH);
-  // bootM4();  
+  bootM4();  
 
-  // if (!SerialRPC.begin(460800)) {
-  //   Serial.println("Failed to initialize SerialRPC!");
-  //   // handle error…
-  // }else {
-  //   Serial.println("SerialRPC initialized successfully!");
-  // }
+  if (!SerialRPC.begin(460800)) {
+    Serial.println("Failed to initialize SerialRPC!");
+    // handle error…
+  }else {
+    Serial.println("SerialRPC initialized successfully!");
+  }
 
-  // while (true) {
-  //   uint8_t byte = 0;
-  //   // Wait until the byte 0xAC is received
-  //     if (SerialRPC.available() > 0) {
-  //       byte = SerialRPC.read();
-  //       if (byte == 0xAC) {
-  //         Serial.println("Received byte 0xAC, starting M7 I2C init...");
-  //         Serial.flush();
-  //         break; // Exit the loop when the byte is received
-  //       }
-  //       char line = (char)byte;
-  //       Serial.print(line);
-  //     }
+  while (true) {
+    uint8_t byte = 0;
+    // Wait until the byte 0xAC is received
+      if (SerialRPC.available() > 0) {
+        byte = SerialRPC.read();
+        if (byte == 0xAC) {
+          Serial.println("Received byte 0xAC, starting M7 I2C init...");
+          Serial.flush();
+          break; // Exit the loop when the byte is received
+        }
+        char line = (char)byte;
+        Serial.print(line);
+      }
     
-  // }
+  }
 
   // Create a thread for the event queue
   // static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
