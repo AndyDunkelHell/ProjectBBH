@@ -3,7 +3,7 @@ MEMORY
     FLASH (rx) : ORIGIN = CM4_BINARY_START, LENGTH = 0x100000
     RAM_D2 (rwx) : ORIGIN = 0x10000000 + (((166 * 4) + 7) & 0xFFFFFFF8), LENGTH = 0x48000 - (((166 * 4) + 7) & 0xFFFFFFF8)
     RAM_D3 (xrw) : ORIGIN = 0x38000000, LENGTH = 64K
-    AXI_SRAM (xrw) : ORIGIN = 0x24000000, LENGTH = 320K
+    AXI_SRAM (xrw) : ORIGIN = 0x24000000, LENGTH = 0xA000  /* 40 KiB */
 }
 REGION_ALIAS("RAM", RAM_D2);
 
@@ -15,8 +15,6 @@ SECTIONS
 {
       .axi_window_buf (NOLOAD) :
   {
-      . = ALIGN(32);
-      *(.axi_window_buf)   /* our array */
       . = ALIGN(32);
   } >AXI_SRAM
 

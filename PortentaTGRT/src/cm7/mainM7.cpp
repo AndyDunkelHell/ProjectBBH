@@ -13,10 +13,10 @@
 #include <SerialRPC.h>
 #include <Adafruit_PWMServoDriver.h>
 
-#define NUM_CHANNELS 12
+#define NUM_CHANNELS 2
 
 
-int CHANNELS[12] = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14};
+int CHANNELS[12] = {1,2};
 
 // Alternatively, you could change the order with:
 // int CHANNELS[12] = {11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1};
@@ -32,7 +32,7 @@ float inBuffer[NUM_CHANNELS][3] = {0};
 float outBuffer[NUM_CHANNELS][3] = {0};
 
 // Create an EventQueue and a Ticker (from Mbed OS)
-events::EventQueue queue(32 * EVENTS_EVENT_SIZE);
+events::EventQueue queue(256 * EVENTS_EVENT_SIZE);
 mbed::Ticker sampleTicker;
 
 static rtos::Thread eventThread(osPriorityHigh, 16 * 1024);
@@ -90,6 +90,7 @@ struct EmgPayload {
 
 static uint16_t seq_counter = 0;
 
+using namespace std::chrono_literals;
 
 
 //================================================================
@@ -117,93 +118,40 @@ void noNotchFilter(uint8_t ch)
 {
   final_channel_data[ch] = channel_data[ch];
 }
+
+  // Static variables to control flush vs. normal operation.
+  // static bool flushing = true; // Start in flush mode.
+  // static int flushCounter = 0; // Count dummy commands issued.
 //================================================================
 // SPI sampling task with pipeline delay handling and queue‐based printing
 //================================================================
-void spiSampleTask()
-{
-  // For a 3-command delay:
-  const int pipelineDelay = 2;
-  // Total number of dummy (flush) commands required:
-  const int flushCommands = NUM_CHANNELS + pipelineDelay;
+// Index for the command being sent in THIS call.
+static uint8_t commandChannelIndex = 0;
+// Counter for how many valid results we have received in this cycle.
+static uint8_t resultsReceivedCount = 0;
 
-  // Static variables to control flush vs. normal operation.
-  static bool flushing = true; // Start in flush mode.
-  static int flushCounter = 0; // Count dummy commands issued.
+volatile int i = 0; 
+void spiSampleTask(){
 
-  // Variables for normal operation (after flush is complete):
-  static bool pipelineInitialized = false;
-  // pipelineQueue will hold channel indices (0 to NUM_CHANNELS-1)
-  static uint8_t pipelineQueue[pipelineDelay];
-  static uint8_t currentChannelIndex = 0; // Next channel index (0...NUM_CHANNELS-1) to issue a command for.
-  static uint8_t sampleCounter = 0;       // Count how many valid samples have been processed.
+  	//Read the channel data from whichever sample in the pipeline corresponds to this 1/2000th of a second
+  if (i == 0) {
+		channel_data[0] = SendConvertCommand(CHANNELS[i]);
+	}
 
-  //------------------------------------------------------------------
-  // FLUSH PHASE: Issue dummy conversion commands to fill the pipeline.
-  //------------------------------------------------------------------
-  if (flushing)
-  {
-    // Issue a dummy conversion command for the channel at currentChannelIndex.
-    SendConvertCommand(CHANNELS[currentChannelIndex]);
-    // Move to the next channel index (wrap around).
-    currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
-    flushCounter++;
-    // When we've issued flushCommands dummy commands, initialize the pipeline.
-    if (flushCounter >= flushCommands)
-    {
-      flushing = false;
-      // Fill the pipelineQueue with the channel indices that correspond to the last 'pipelineDelay' commands.
-      for (int i = flushCommands - pipelineDelay; i < flushCommands; i++)
-      {
-        // Instead of storing CHANNELS[i % NUM_CHANNELS],
-        // store the channel index (i % NUM_CHANNELS).
-        pipelineQueue[i - (flushCommands - pipelineDelay)] = i % NUM_CHANNELS;
-      }
-      pipelineInitialized = true;
-    }
-    return; // Don't process any result during flushing.
-  }
+	if (i == 1) {
+		channel_data[1] = SendConvertCommand(CHANNELS[i]);
 
-  // Safety check (should never happen)
-  if (!pipelineInitialized)
-  {
-    return;
-  }
+	}
 
-  //------------------------------------------------------------------
-  // NORMAL OPERATION: Process conversion results in a round-robin manner.
-  //------------------------------------------------------------------
-  // Issue a conversion command for the current channel.
-  uint16_t newResult = SendConvertCommandH(CHANNELS[currentChannelIndex]);
+  final_channel_data[i] = channel_data[i];
 
-  // The returned result corresponds to the channel at the head of the pipeline.
-  uint8_t channelIndexToProcess = pipelineQueue[0];
-
-  // Shift the pipelineQueue one position to the left.
-  for (int i = 0; i < pipelineDelay - 1; i++)
-  {
-    pipelineQueue[i] = pipelineQueue[i + 1];
-  }
-  // Append the current channel index at the end of the pipeline.
-  pipelineQueue[pipelineDelay - 1] = currentChannelIndex;
-
-  // Update currentChannelIndex for next call (wrap around).
-  currentChannelIndex = (currentChannelIndex + 1) % NUM_CHANNELS;
-
-  // Store the new conversion result into the proper slot.
-  channel_data[channelIndexToProcess] = newResult;
-  // Process the raw data – if you're not filtering, use the noNotchFilter.
-  noNotchFilter(channelIndexToProcess);
-  // NotchFilter50(channelIndexToProcess);
-
-  // Increment the sample counter. When we've processed a full cycle of NUM_CHANNELS samples,
-  // schedule printing of the complete set.
-  sampleCounter++;
-  if (sampleCounter >= NUM_CHANNELS)
-  {
-    queue.call(printAllSamples);
-    sampleCounter = 0;
-  }
+  if (i == 1)
+{		//If we just read the data from the SECONDCHANNEL, read FIRSTCHANNEL on the next iteration
+		i = 0;
+    queue.call(printAllSamples);}
+	else
+{		//If we just read the data from the FIRSTCHANNEL, read SECONDCHANNEL on the next iteration
+		i++;}
 
 }
 
@@ -214,7 +162,7 @@ void spiSampleTask()
 void imuReceiveTask() {
   static char buf[80];
   size_t idx = 0;
-  int32_t       predicted = -1;
+  // int32_t       predicted = -1;
 
   while (true) {
     if(boardMode){
@@ -275,18 +223,6 @@ void imuReceiveTask() {
   }
 }
 
-void listenM4(CommandParameter &parameters)
-{
-  Serial.println(F("Listening to M4"));
-  // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-  if(SerialRPC.available()){
-    Serial.println(F("SerialRPC available"));
-    char line = (char)SerialRPC.read();
-    // Debug echo of raw characters:
-    Serial.print(line);
-  }
-}
-
 //================================================================
 // Print function: prints all channel samples at once.
 //================================================================
@@ -297,10 +233,10 @@ void printAllSamples()
     // Serial.print("ELEC,");
     for (uint8_t i = 0; i < NUM_CHANNELS; i++)
     {
-      serialData = (int)(final_channel_data[i] * 0.195);
-      Serial.print(serialData);
+      serialData = (final_channel_data[i] * 0.195);
+      SerialUSB.print(serialData);
       if (i < NUM_CHANNELS - 1)
-        Serial.print(",");
+        SerialUSB.print(",");
     }
       // Append IMU data from ring buffer or previous sample
       Serial.print("|");
@@ -325,9 +261,8 @@ void printAllSamples()
               "%ld,%ld,%ld,%ld,%ld,%ld",
               s.ax, s.ay, s.az,
               s.gx, s.gy, s.gz);
-      Serial.print(imuBuf);  // All in one atomic call
+      SerialUSB.println(imuBuf);  // All in one atomic call
 
-      Serial.println();      // Terminate line
       return;
 
     }
@@ -340,7 +275,7 @@ void printAllSamples()
       hdr.len  = sizeof(EmgPayload);
 
       EmgPayload payload;
-      for (int ch = 0; ch < 12; ch++)
+      for (int ch = 0; ch < NUM_CHANNELS; ch++)
         payload.values[ch] = final_channel_data[ch];
 
       // write header + payload in one go:
@@ -348,7 +283,6 @@ void printAllSamples()
       SerialRPC.write((uint8_t*)&payload, sizeof(payload));
 
 }
-
 
 
 //================================================================
@@ -401,6 +335,7 @@ void Calibrate()
   {
     SendReadCommand(40);
   }
+  
 }
 
 //================================================================
@@ -408,7 +343,9 @@ void Calibrate()
 //================================================================
 void timerCallback()
 {
-  queue.call(spiSampleTask);
+  // queue.call(spiSampleTask);
+  bool ok = queue.call(spiSampleTask);
+  if (!ok) digitalWrite(LED_BUILTIN, HIGH);
 }
 
 //================================================================
@@ -492,10 +429,10 @@ void setupCHIP_Timer()
 
   Calibrate();
 
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
-  {
-    SendConvertCommandH(CHANNELS[ch]);
-  }
+  // for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
+  // {
+  //   SendConvertCommandH(CHANNELS[ch]);
+  // }
   for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++)
   {
     SendConvertCommand(CHANNELS[ch]);
@@ -591,11 +528,13 @@ void scanI2C() {
 
 void conn(CommandParameter &Parameters)
 {
-  Serial.println("Connected");
+  // Serial.println("Connected");
   startSerial = true;
+  SendConvertCommand(CHANNELS[0]);
+  SendConvertCommand(CHANNELS[1]);
   // Set the sampling ticker to trigger at about 83 microseconds (approx. 12kHz sample rate)
-  sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
-  Serial.println("Ticker attached, sampling started.");
+  sampleTicker.attach(timerCallback, std::chrono::microseconds(1000));
+  // Serial.println("Ticker attached, sampling started.");
 
 }
 
@@ -693,7 +632,7 @@ void modeSwitch(CommandParameter &parameters)
     uint8_t code = 0x01;
     Serial.println(F("Prediction mode"));
     SerialRPC.write(&code, 1);
-    sampleTicker.attach(timerCallback, std::chrono::microseconds(83));
+    sampleTicker.attach(timerCallback, std::chrono::microseconds(125));
   }
 }
 
@@ -702,10 +641,11 @@ void modeSwitch(CommandParameter &parameters)
 //================================================================
 void setup()
 {
-  Serial.begin(250000);
-  while (!Serial)
-  {
-  } // Wait for Serial to initialize
+  // Serial.begin(1000000);
+  pinMode(LED_BUILTIN, OUTPUT);
+  SerialUSB.begin(1000000);
+  while (!SerialUSB)
+  {} // Wait for Serial to initialize
   Serial.println("Starting simplified connection test...");
   testSPIConnection();
   Wire.begin();
@@ -741,6 +681,7 @@ void setup()
         byte = SerialRPC.read();
         if (byte == 0xAC) {
           Serial.println("Received byte 0xAC, starting M7 I2C init...");
+          Serial.flush();
           break; // Exit the loop when the byte is received
         }
         char line = (char)byte;
@@ -752,6 +693,7 @@ void setup()
   // Create a thread for the event queue
   // static rtos::Thread eventThread(osPriorityHigh, 16000); // 16KB stack
   eventThread.start(callback(&queue, &events::EventQueue::dispatch_forever));
+  // usbWriteThread.start(usbWriteTask);
   // Start background thread to fetch IMU data from M4
   // static rtos::Thread imuThread(osPriorityNormal, 4*1024);
   if (IMU_board) {
@@ -769,7 +711,6 @@ void setup()
   SerialCommandHandler.AddCommand(F("UD"), UpdateDeg);
   SerialCommandHandler.AddCommand(F("identity"), BBHIdentity);
   SerialCommandHandler.AddCommand(F("mode"), modeSwitch);
-  SerialCommandHandler.AddCommand(F("listen"), listenM4);
 }
 
 
@@ -782,6 +723,7 @@ void loop()
   // {
   SerialCommandHandler.Process();
   // }
+
 }
 
 //================================================================

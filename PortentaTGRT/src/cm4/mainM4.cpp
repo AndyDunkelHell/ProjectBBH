@@ -402,7 +402,7 @@ void loop() {
   sensors_event_t accel, gyro, temp;
   if(IMU_board){
       imu.getEvent(&accel, &gyro, &temp);
-      rtos::ThisThread::sleep_for(2ms);
+      // rtos::ThisThread::sleep_for(2ms);
   }
   
   
@@ -461,12 +461,12 @@ void loop() {
       window_buf[emg_idx][c] = float(payload.values[c]);
     }
     // // Now add the IMU data to the remaining 6 channels
-    window_buf[emg_idx][12] = accel.acceleration.x * 1000.0f;
-    window_buf[emg_idx][13] = accel.acceleration.y * 1000.0f;
-    window_buf[emg_idx][14] = accel.acceleration.z * 1000.0f;
-    window_buf[emg_idx][15] = gyro.gyro.x * 1000.0f;
-    window_buf[emg_idx][16] = gyro.gyro.y * 1000.0f;
-    window_buf[emg_idx][17] = gyro.gyro.z * 1000.0f;
+    window_buf[emg_idx][12] = accel.acceleration.x;
+    window_buf[emg_idx][13] = accel.acceleration.y;
+    window_buf[emg_idx][14] = accel.acceleration.z;
+    window_buf[emg_idx][15] = gyro.gyro.x;
+    window_buf[emg_idx][16] = gyro.gyro.y;
+    window_buf[emg_idx][17] = gyro.gyro.z;
 
     // 5) Advance window index and run inference when the window is full
     if (++emg_idx >= 512) {
