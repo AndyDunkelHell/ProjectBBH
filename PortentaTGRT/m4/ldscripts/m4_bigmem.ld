@@ -15,7 +15,9 @@ SECTIONS
 {
       .axi_window_buf (NOLOAD) :
   {
-      . = ALIGN(32);
+    . = ALIGN(32);
+    *(.axi_window_buf)      /* ⟵ collect variables tagged with this section */
+    . = ALIGN(32);
   } >AXI_SRAM
 
     .text :

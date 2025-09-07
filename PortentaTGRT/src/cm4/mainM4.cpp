@@ -14,9 +14,8 @@
 // #include <tensorflow/lite/version.h>
 
 // Include the TensorFlow Lite model file.
-#include "modelv2nocls.h"
-#include "test_samples.h"
-// #define Serial SerialRPC 
+#include "model_final.h"
+#include "test_samples.h" 
 
 extern TwoWire Wire1;
 Adafruit_LSM6DS3TRC imu;
@@ -30,7 +29,7 @@ static tflite::MicroMutableOpResolver<kOpResolverMaxOps> resolver;
 constexpr size_t kTensorArenaSize = 140 * 1024;
 uint8_t tensor_arena[kTensorArenaSize]
     __attribute__((section(".bss.$RAM_D2"), aligned(16)));
-static const tflite::Model* model = tflite::GetModel(model2Dv2_noclsflat_tflite);
+static const tflite::Model* model = tflite::GetModel(model_StudentGold_Final_tflite);
 static tflite::MicroInterpreter* interp;
 static TfLiteTensor* input_tensor;
 static TfLiteTensor* output_tensor;
@@ -39,10 +38,6 @@ bool initInterp = false; // Flag to check if interpreter is initialized
 static float window_buf[512][18] __attribute__((section(".axi_window_buf"), aligned(32), used));
 
 static int N_CLASSES = 4; // number of classes in the model
-
-struct EmgPacket { 
-  int16_t values[12]; 
-};
 
 struct PacketHeader {
   uint8_t  sync;     // fixed magic, e.g. 0xAA
@@ -55,11 +50,7 @@ struct PacketHeader {
 struct EmgPayload {
   int16_t values[12];
 };
-
-// Thread handle
-// static rtos::Thread rpcThread(osPriorityHigh, 16 * 1024); 
-                                       // 16 KB stack for safety
-
+//================================================================
 // Forward declarations
 void initInterpreter();
 void rpcReceiveTask();
@@ -73,6 +64,7 @@ extern "C" void DebugLog(const char* s) {
   }
 }
 
+// Helper to log formatted messages via the TFLM error reporter and Serial with the M7 core
 void LogMessage(const char* format, ...) {
   if (!Serial) { // Don't try to log if Serial isn't ready
     return;
@@ -129,207 +121,259 @@ void initInterpreter() {
   initInterp = true; // Interpreter is initialized
 }
 
-// Test run inference on a single test sample
-void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS], const char* sample_name, int expected_label) {
-  if (interp == nullptr || input_tensor == nullptr || output_tensor == nullptr) {
+// Test run inference on a single test sample (mirrors runInference pipeline)
+void run_test_inference(const float sample_data[][TEST_SAMPLE_N_CHANNELS],
+                        const char* sample_name,
+                        int expected_label) {
+  if (!interp || !input_tensor || !output_tensor) {
     SerialRPC.println("ERROR: Interpreter not ready for test inference.");
     return;
   }
 
-  SerialRPC.print("Running test inference for: ");
-  SerialRPC.print(sample_name);
-  SerialRPC.print(" (Expected Label: ");
-  SerialRPC.print(expected_label);
-  SerialRPC.println(")");
-    // Inside run_test_inference, before copying to input_tensor
-  SerialRPC.print("Sample data check [0][0]: "); SerialRPC.println(sample_data[0][0], 6);
-  SerialRPC.print("Sample data check [10][5]: "); SerialRPC.println(sample_data[10][5], 6);
-  SerialRPC.print("Sample data check [MAX-1][MAX-1]: "); SerialRPC.println(sample_data[TEST_SAMPLE_WINDOW_SIZE-1][TEST_SAMPLE_N_CHANNELS-1], 6);
+  // Expect [1, 512, 18] float32
+  const int T = TEST_SAMPLE_WINDOW_SIZE;   // 512
+  const int C = TEST_SAMPLE_N_CHANNELS;    // 18
+  const int EMG_C = 12;                    // first 12 = EMG
 
-  // 1. Copy test sample data to the input tensor
-  // Assuming float32 input. If your model is int8 input, this needs to change.
-  if (input_tensor->type == kTfLiteFloat32) {
-    // Check dimensions
-    if (input_tensor->dims->size != 3 || // Should be [1, WINDOW_SIZE, N_CHANNELS]
-        input_tensor->dims->data[0] != 1 ||
-        input_tensor->dims->data[1] != TEST_SAMPLE_WINDOW_SIZE ||
-        input_tensor->dims->data[2] != TEST_SAMPLE_N_CHANNELS) {
-      
-      SerialRPC.print("ERROR: Test sample dimensions: [1][");
-      SerialRPC.print(TEST_SAMPLE_WINDOW_SIZE);
-      SerialRPC.print("][");
-      SerialRPC.print(TEST_SAMPLE_N_CHANNELS);
-      SerialRPC.print("] do not match input tensor: [");
-      SerialRPC.print(input_tensor->dims->data[0]);
-      SerialRPC.print("][");
-      SerialRPC.print(input_tensor->dims->data[1]);
-      SerialRPC.print("][");
-      SerialRPC.print(input_tensor->dims->data[2]);
-      SerialRPC.println("]");
-      return;
-    }
-    // Copy data to input tensor
-    memcpy(input_tensor->data.f, sample_data, TEST_SAMPLE_WINDOW_SIZE * TEST_SAMPLE_N_CHANNELS * sizeof(float));
-
-  } else if (input_tensor->type == kTfLiteInt8) {
-
-    SerialRPC.println("ERROR: Input tensor is int8, but test samples are float. Implement quantization for test samples.");
-    // TODO: If your model input is int8, you need to quantize sample_data here
-    // using input_tensor->params.scale and input_tensor->params.zero_point
-    // and ensure test_samples.h provides int8_t data.
-    return;
-  } else {
-
-    SerialRPC.println("ERROR: Unsupported input tensor type.");
+  if (!input_tensor->dims || input_tensor->dims->size != 3 ||
+      input_tensor->dims->data[0] != 1 ||
+      input_tensor->dims->data[1] != T ||
+      input_tensor->dims->data[2] != C ||
+      input_tensor->type != kTfLiteFloat32) {
+    SerialRPC.println("ERROR: input must be [1,512,18] float32.");
     return;
   }
 
-  SerialRPC.print("tensor[0]  ");  SerialRPC.println(input_tensor->data.f[0], 6);
-  SerialRPC.print("tensor[17] ");  SerialRPC.println(input_tensor->data.f[17], 6);
-  SerialRPC.print("dims->size = "); SerialRPC.println(input_tensor->dims->size);
-  SerialRPC.print("dims        = [");
-  for (int i = 0; i < input_tensor->dims->size; ++i) {
-    SerialRPC.print(input_tensor->dims->data[i]); SerialRPC.print(i+1 == input_tensor->dims->size ? "]\n" : "][");
-}
-  // 2. Perform inference
-  unsigned long startTime = micros();
-  TfLiteStatus invoke_status = interp->Invoke();
-  unsigned long duration = micros() - startTime;
+  // --- scratch buffers (stack/static; no heap) ---
+  static float tmp_in [TEST_SAMPLE_WINDOW_SIZE];
+  static float tmp_bp [TEST_SAMPLE_WINDOW_SIZE];
+  static float tmp_tke[TEST_SAMPLE_WINDOW_SIZE];
+  static float tmp_ma [TEST_SAMPLE_WINDOW_SIZE];
 
-  if (invoke_status != kTfLiteOk) {
-    SerialRPC.print("ERROR: Invoke failed for ");
-    SerialRPC.print(sample_name);
-    SerialRPC.print(" Status: ");
-    SerialRPC.println(static_cast<int>(invoke_status));
-    return;
-  }
-
-  SerialRPC.print("Inference for ");
-  SerialRPC.print(sample_name);
-  SerialRPC.print(" took ");
-  SerialRPC.print(duration);
-  SerialRPC.println(" microseconds.");
-
-  // Get output tensor and process results
-  // Assuming float32 output. If int8, dequantization is needed.
-  if (output_tensor->type == kTfLiteFloat32) {
-    SerialRPC.print("Output logits for ");
-    SerialRPC.print(sample_name);
-    SerialRPC.print(": [");
-    // Assuming output_tensor->dims->data[0] is batch (should be 1)
-    // and output_tensor->dims->data[1] is N_CLASSES
-    int num_classes_output = output_tensor->dims->data[output_tensor->dims->size -1]; // Last dimension is num_classes
-    if (num_classes_output != N_CLASSES) {
-        SerialRPC.print(" WARN: Output tensor classes (");
-        SerialRPC.print(num_classes_output);
-        SerialRPC.print(") != N_CLASSES (");
-        SerialRPC.print(N_CLASSES);
-        SerialRPC.print("). Check model. ");
-    }
-
-    for (int i = 0; i < num_classes_output; ++i) {
-      SerialRPC.print(output_tensor->data.f[i], 6); // Print float output
-      if (i < num_classes_output - 1) {
-        SerialRPC.print(", ");
+  // Same helpers as in runInference()
+  auto fir_same = [](const float* x, float* y, int n, const float* h, int m) {
+    const int half = (m - 1) / 2;
+    for (int t = 0; t < n; ++t) {
+      float acc = 0.0f;
+      for (int k = 0; k < m; ++k) {
+        int xi = t - k + half;
+        float xv = (xi >= 0 && xi < n) ? x[xi] : 0.0f;
+        acc += h[k] * xv;
       }
+      y[t] = acc;
     }
-    SerialRPC.println("]");
+  };
+  auto teager = [](const float* x, float* e, int n) {
+    if (n == 0) return;
+    if (n == 1) { e[0] = 0.0f; return; }
+    e[0] = 0.0f;
+    for (int t = 1; t < n - 1; ++t) {
+      float xt = x[t];
+      e[t] = xt * xt - x[t - 1] * x[t + 1];
+    }
+    e[n - 1] = 0.0f;
+  };
+  auto movavg = [](const float* x, float* y, int n, int win) {
+    if (win <= 1) { for (int i = 0; i < n; ++i) y[i] = x[i]; return; }
+    int half = win / 2;
+    for (int i = 0; i < n; ++i) {
+      int i0 = i - half, i1 = i + (win - half - 1);
+      float s = 0.0f;
+      for (int j = i0; j <= i1; ++j) if (j >= 0 && j < n) s += x[j];
+      y[i] = s / (float)win;
+    }
+  };
 
-    // Find predicted class
-    int predicted_class = -1;
-    float max_val = -1000000.0f; // Initialize with a very small number
-    for (int i = 0; i < num_classes_output; ++i) {
-      if (output_tensor->data.f[i] > max_val) {
-        max_val = output_tensor->data.f[i];
-        predicted_class = i;
-      }
-    }
-    SerialRPC.print("Predicted class for ");
-    SerialRPC.print(sample_name);
-    SerialRPC.print(": ");
-    SerialRPC.print(predicted_class);
-    if (predicted_class == expected_label) {
-      SerialRPC.println(" (Correct!)");
+  // 1) Build input features channel-by-channel, then z-score into input tensor
+  float* dst = input_tensor->data.f;
+
+  for (int c = 0; c < C; ++c) {
+    // Gather channel c from the provided test sample
+    for (int t = 0; t < T; ++t) tmp_in[t] = sample_data[t][c];
+
+    const float* feat = nullptr;
+
+    if (c < EMG_C) {
+      // EMG: band-pass -> TKE -> moving average (same as runInference)
+      #if defined(BP_NUM_TAPS)
+        fir_same(tmp_in, tmp_bp, T, BP_TAPS, BP_NUM_TAPS);
+      #else
+        for (int t = 0; t < T; ++t) tmp_bp[t] = tmp_in[t];
+      #endif
+
+      teager(tmp_bp, tmp_tke, T);
+
+      #if defined(MA_WIN)
+        movavg(tmp_tke, tmp_ma, T, MA_WIN);
+        feat = tmp_ma;
+      #else
+        feat = tmp_tke;
+      #endif
     } else {
-      SerialRPC.print(" (Incorrect, expected: ");
-      SerialRPC.print(expected_label);
-      SerialRPC.println(")");
+      // IMU: no BP/TKE/MA — use raw channel (same as runInference)
+      feat = tmp_in;
     }
 
-  } else if (output_tensor->type == kTfLiteInt8) {
-    // global_error_reporter.Report("Output tensor is int8. Test sample processing needs dequantization.");
-    SerialRPC.println("INFO: Output tensor is int8. Implement dequantization to see float values.");
-    // TODO: If your model output is int8, you need to dequantize output_tensor->data.int8 here
-    // using output_tensor->params.scale and output_tensor->params.zero_point.
-    // Then find the predicted class from the dequantized float values.
-  } else {
-    // global_error_reporter.Report("Unsupported output tensor type for test inference.");
-    SerialRPC.println("ERROR: Unsupported output tensor type.");
+    // z-score with train-time MU/SIGMA from test_samples.h
+    const float mu_c = MU[c];
+    const float sg_c = SIGMA[c];
+    const float inv_sg = (sg_c != 0.0f) ? (1.0f / sg_c) : 0.0f;
+
+    for (int t = 0; t < T; ++t) {
+      dst[t * C + c] = (sg_c != 0.0f) ? (feat[t] - mu_c) * inv_sg : 0.0f;
+    }
   }
+
+  // 2) Inference
+  unsigned long start_us = micros();
+  TfLiteStatus status = interp->Invoke();
+  unsigned long dur_us = micros() - start_us;
+
+  if (status != kTfLiteOk) {
+    SerialRPC.print("ERROR: Invoke failed for "); SerialRPC.println(sample_name);
+    return;
+  }
+
+  // 3) Read logits, argmax, print summary
+  int num_classes_output = output_tensor->dims->data[output_tensor->dims->size - 1];
+  int predicted_class = 0;
+  float* out = output_tensor->data.f;
+  for (int i = 1; i < num_classes_output; ++i) if (out[i] > out[predicted_class]) predicted_class = i;
+
+  SerialRPC.print("Inference for "); SerialRPC.print(sample_name);
+  SerialRPC.print(" took "); SerialRPC.print(dur_us); SerialRPC.println(" us.");
+  SerialRPC.print("Logits: [");
+  for (int i = 0; i < num_classes_output; ++i) {
+    SerialRPC.print(out[i], 6);
+    if (i < num_classes_output - 1) SerialRPC.print(", ");
+  }
+  SerialRPC.println("]");
+
+  SerialRPC.print("Predicted class: "); SerialRPC.print(predicted_class);
+  SerialRPC.print(predicted_class == expected_label ? " (Correct!)" : " (Incorrect, expected: ");
+  if (predicted_class != expected_label) { SerialRPC.print(expected_label); SerialRPC.print(")"); }
+  SerialRPC.println();
   SerialRPC.println("------------------------------------");
 }
+
+
+// Test run inference on a single test sample
 void runInference() {
   SerialRPC.print("I");
-  // --- Start: Print Input Tensor Details ---
-  if (input_tensor != nullptr) {
-    SerialRPC.print("Input Tensor Details:\n"); // Use \n for newline if SerialRPC handles it, otherwise separate println calls
-
-    // Print Tensor Type
-    SerialRPC.print("  Type (as int): ");
-    SerialRPC.println(static_cast<int>(input_tensor->type)); // kTfLiteFloat32 is 1, kTfLiteInt8 is 3, etc.
-
-    // Print Tensor Bytes (total size)
-    SerialRPC.print("  Bytes: ");
-    SerialRPC.println(input_tensor->bytes);
-
-    // Print Number of Dimensions
-    if (input_tensor->dims != nullptr) {
-      SerialRPC.print("  Num Dimensions: ");
-      SerialRPC.println(input_tensor->dims->size);
-
-      // Print Each Dimension's Size
-      SerialRPC.print("  Dimensions: [");
-      for (int i = 0; i < input_tensor->dims->size; ++i) {
-        SerialRPC.print(input_tensor->dims->data[i]);
-        if (i < input_tensor->dims->size - 1) {
-          SerialRPC.print(", ");
-        }
-      }
-      SerialRPC.println("]");
-    } else {
-      SerialRPC.println("  Dims structure is null.");
-    }
-  } else {
-    SerialRPC.println("Input_tensor is null.");
+  if (!interp || !input_tensor || !output_tensor) {
+    SerialRPC.println("ERROR: Interpreter not ready.");
+    return;
   }
-  SerialRPC.println("--- End: Input Tensor Details ---");
-  // --- End: Print Input Tensor Details ---
-  memcpy(input_tensor->data.f,
-         window_buf,
-         sizeof(window_buf));
 
-  // 2) invoke
+  // Expect [1, 512, 18] float32
+  const int T = TEST_SAMPLE_WINDOW_SIZE;   // 512
+  const int C = TEST_SAMPLE_N_CHANNELS;    // 18
+  const int EMG_C = 12;                    // first 12 = EMG
+
+  if (!input_tensor->dims || input_tensor->dims->size != 3 ||
+      input_tensor->dims->data[0] != 1 ||
+      input_tensor->dims->data[1] != T ||
+      input_tensor->dims->data[2] != C ||
+      input_tensor->type != kTfLiteFloat32) {
+    SerialRPC.println("ERROR: input must be [1,512,18] float32.");
+    return;
+  }
+
+  // --- small scratch buffers (stack/static to avoid heap) ---
+  static float tmp_in [TEST_SAMPLE_WINDOW_SIZE];
+  static float tmp_bp [TEST_SAMPLE_WINDOW_SIZE];
+  static float tmp_tke[TEST_SAMPLE_WINDOW_SIZE];
+  static float tmp_ma [TEST_SAMPLE_WINDOW_SIZE];
+
+  // Simple helpers
+  auto fir_same = [](const float* x, float* y, int n, const float* h, int m) {
+    const int half = (m - 1) / 2;
+    for (int t = 0; t < n; ++t) {
+      float acc = 0.0f;
+      for (int k = 0; k < m; ++k) {
+        int xi = t - k + half;
+        float xv = (xi >= 0 && xi < n) ? x[xi] : 0.0f;
+        acc += h[k] * xv;
+      }
+      y[t] = acc;
+    }
+  };
+  auto teager = [](const float* x, float* e, int n) {
+    if (n == 0) return;
+    if (n == 1) { e[0] = 0.0f; return; }
+    e[0] = 0.0f;
+    for (int t = 1; t < n - 1; ++t) {
+      float xt = x[t];
+      e[t] = xt * xt - x[t - 1] * x[t + 1];
+    }
+    e[n - 1] = 0.0f;
+  };
+  auto movavg = [](const float* x, float* y, int n, int win) {
+    if (win <= 1) { for (int i = 0; i < n; ++i) y[i] = x[i]; return; }
+    int half = win / 2;
+    for (int i = 0; i < n; ++i) {
+      int i0 = i - half, i1 = i + (win - half - 1);
+      float s = 0.0f;
+      for (int j = i0; j <= i1; ++j) if (j >= 0 && j < n) s += x[j];
+      y[i] = s / (float)win;
+    }
+  };
+
+  // 1) Build input features channel-by-channel, then z-score into input tensor
+  float* dst = input_tensor->data.f;
+
+  for (int c = 0; c < C; ++c) {
+    // Gather channel c from live ring/window buffer
+    for (int t = 0; t < T; ++t) tmp_in[t] = window_buf[t][c];
+
+    const float* feat = nullptr;
+
+    if (c < EMG_C) {
+      // EMG: band-pass -> TKE -> moving average
+      #if defined(BP_NUM_TAPS)
+        fir_same(tmp_in, tmp_bp, T, BP_TAPS, BP_NUM_TAPS);
+      #else
+        for (int t = 0; t < T; ++t) tmp_bp[t] = tmp_in[t]; // pass-through if no taps compiled
+      #endif
+
+      teager(tmp_bp, tmp_tke, T);
+
+      #if defined(MA_WIN)
+        movavg(tmp_tke, tmp_ma, T, MA_WIN);
+        feat = tmp_ma;
+      #else
+        feat = tmp_tke;
+      #endif
+    } else {
+      // IMU: no BP/TKE/MA — use raw channel
+      feat = tmp_in;
+    }
+
+    // z-score with train-time MU/SIGMA from test_samples.h
+    const float mu_c = MU[c];
+    const float sg_c = SIGMA[c];
+    const float inv_sg = (sg_c != 0.0f) ? (1.0f / sg_c) : 0.0f;
+
+    for (int t = 0; t < T; ++t) {
+      dst[t * C + c] = (sg_c != 0.0f) ? (feat[t] - mu_c) * inv_sg : 0.0f;
+    }
+  }
+
+  // 2) Invoke
   TfLiteStatus status = interp->Invoke();
   if (status != kTfLiteOk) {
-  TF_LITE_REPORT_ERROR(&error_reporter,
-                       "Invoke failed with status: %d\n",
-                       static_cast<int>(status));
-
-    char msg[32];
-    int n = snprintf(msg, sizeof(msg),
-                     "INVOKE_ERR:%d\n", static_cast<int>(status));
+    TF_LITE_REPORT_ERROR(&error_reporter, "Invoke failed: %d\n", (int)status);
+    char msg[32]; int n = snprintf(msg, sizeof(msg), "INVOKE_ERR:%d\n", (int)status);
     SerialRPC.write(msg, n);
     return;
   }
 
-  // 3) send back your predicted class
+  // 3) Argmax over float32 logits and send class
+  int best = 0;
   float* out = output_tensor->data.f;
-  int   best = 0;
-  for (int i = 1; i < N_CLASSES; ++i) {
-    if (out[i] > out[best]) best = i;
-  }
-  char msg[16];
-  int  n = snprintf(msg, sizeof(msg), "C:%d\n", best);
+  for (int i = 1; i < N_CLASSES; ++i) if (out[i] > out[best]) best = i;
+
+  char msg[16]; int n = snprintf(msg, sizeof(msg), "C:%d\n", best);
   SerialRPC.write(msg, n);
 }
 

@@ -95,6 +95,8 @@ volatile int i = 0;
 volatile float in[NUM_CHANNELS][3] = {{0}}; //Keep track of past values of the original signal, which helps the notch filter remove 50 Hz or 60 Hz noise
 volatile float out[NUM_CHANNELS][3] = {{0}}; //Keep track of the past values of the processed signal, which helps the notch filter remove 50 Hz or 60 Hz noise 
 
+static uint32_t g_seq = 0; // Global sequence number for EMG+IMU mode
+
 //================================================================
 // Notch filter (unchanged)
 //================================================================
@@ -229,6 +231,14 @@ void printAllSamples()
 {
   // EMG+IMU sampling mode
   if(!boardMode){
+
+    // inside printAllSamples() before printing EMG values:
+    uint32_t t_us = micros();            // device-side microseconds since boot
+    SerialUSB.print(t_us);
+    SerialUSB.print("|");
+    SerialUSB.print(g_seq++);            // sequence helps detect drops
+    SerialUSB.print("|");
+
     // Serial.print("ELEC,");
     for (uint8_t i = 0; i < NUM_CHANNELS; i++)
     {
