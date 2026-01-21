@@ -4,7 +4,7 @@
 #include <Adafruit_PWMServoDriver.h>
 #include "CommandHandler.h"
 
-static int servo_angles[16];
+static int servo_angles[16] = {80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80};
 int i = 0;
 static int k[1];
 
@@ -53,7 +53,7 @@ void setup() {
   pwm.begin();
   pwm.setPWMFreq(60);  // Analog servos run at ~60 Hz updates
   pwm.setOscillatorFrequency(27000000);
-  pwm.setPWM(0, 0, SERVOMIN);
+  // pwm.setPWM(0, 0, SERVOMAX);
 
 
   SerialCommandHandler.AddCommand(F("connect"), conn);
@@ -73,14 +73,16 @@ int angleToPulseinv(int ang){
 
 
 void setAllServosAngle(){
-{
-  for (int i = 0; i < 4; i ++)
-  {
-    pwm.setPWM(i+k[0],0,angleToPulse(servo_angles[i+k[0]]));
-  }
+
+
+  pwm.setPWM(0+k[0],0,angleToPulseinv(servo_angles[0+k[0]]));
+  pwm.setPWM(1+k[0],0,angleToPulseinv(servo_angles[1+k[0]]));
+  pwm.setPWM(2+k[0],0,angleToPulseinv(servo_angles[2+k[0]]));
+  pwm.setPWM(3+k[0],0,angleToPulse(servo_angles[3+k[0]]));
+
 }
     
-}
+
 
 void loop() {
   SerialCommandHandler.Process();
